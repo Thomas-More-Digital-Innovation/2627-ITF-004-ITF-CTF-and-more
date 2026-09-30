@@ -4,6 +4,33 @@ var builder = WebApplication.CreateBuilder(args);
 // Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
 builder.Services.AddOpenApi();
 
+// Lowercase urls
+builder.Services.AddRouting(options => options.LowercaseUrls = true);
+
+builder.Services.AddControllers();
+
+// API documentation
+builder.Services.AddOpenApi();
+builder.Services.AddSwaggerGen();
+
+
+// CORS
+builder.Services.AddCors(options => options.AddDefaultPolicy(policy =>
+{
+    var section = builder.Configuration.GetSection("CorsSettings");
+    var origins = section.GetSection("AllowedOrigins").Get<string[]>() ?? [];
+    var methods = section.GetSection("AllowedMethods").Get<string[]>() ?? [];
+    var headers = section.GetSection("AllowedHeaders").Get<string[]>() ?? [];
+    var exposed = section.GetSection("ExposedHeaders").Get<string[]>() ?? [];
+
+    _ = origins.Contains("*") ? policy.AllowAnyOrigin() : policy.WithOrigins(origins);
+    _ = methods.Contains("*") ? policy.AllowAnyMethod() : policy.WithMethods(methods);
+    _ = headers.Contains("*") ? policy.AllowAnyHeader() : policy.WithHeaders(headers);
+
+    if (exposed.Length > 0) policy.WithExposedHeaders(exposed);
+    if (section.GetValue<bool>("AllowCredentials") && !origins.Contains("*")) policy.AllowCredentials();
+}));
+
 var app = builder.Build();
 
 // Configure the HTTP request pipeline.
@@ -12,30 +39,16 @@ if (app.Environment.IsDevelopment())
     app.MapOpenApi();
 }
 
+// API documentation
+if (app.Environment.IsDevelopment())
+{
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
 app.UseHttpsRedirection();
 
-var summaries = new[]
-{
-    "Freezing", "Bracing", "Chilly", "Cool", "Mild", "Warm", "Balmy", "Hot", "Sweltering", "Scorching"
-};
+app.UseCors();
 
-app.MapGet("/weatherforecast", () =>
-{
-    var forecast =  Enumerable.Range(1, 5).Select(index =>
-        new WeatherForecast
-        (
-            DateOnly.FromDateTime(DateTime.Now.AddDays(index)),
-            Random.Shared.Next(-20, 55),
-            summaries[Random.Shared.Next(summaries.Length)]
-        ))
-        .ToArray();
-    return forecast;
-})
-.WithName("GetWeatherForecast");
+app.MapControllers();
 
 app.Run();
-
-record WeatherForecast(DateOnly Date, int TemperatureC, string? Summary)
-{
-    public int TemperatureF => 32 + (int)(TemperatureC / 0.5556);
-}
