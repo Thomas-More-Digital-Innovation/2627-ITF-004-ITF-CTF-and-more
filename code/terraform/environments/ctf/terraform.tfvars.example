@@ -1,0 +1,21 @@
+proxmox_connection = {
+  endpoint = "https://pve.be:8006"
+
+  # Use either:
+  # username = "your-user"
+  # password = "your-password"
+  # or
+  api_token = "your-api-token@pve!terraform=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+}
+
+vm_defaults = {
+  node_name              = "pve"
+  tags                   = [ "terraform" ]
+  provisioning_wait_time = 0 # Time in seconds to wait between VM (re)creations
+}
+
+cloud_image = {
+  url          = "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2"
+  file_name    = "debian-12-generic-amd64.img"
+  datastore_id = "truenas-isos"
+}
