@@ -9,6 +9,8 @@ builder.Services.AddRouting(options => options.LowercaseUrls = true);
 
 builder.Services.AddControllers();
 
+builder.Services.AddScoped<Application.Interfaces.IEnvironmentService, Infrastructure.Services.EnvironmentService>();
+
 // API documentation
 builder.Services.AddOpenApi();
 builder.Services.AddSwaggerGen();

@@ -1,7 +1,6 @@
-﻿using Domain.Models;
 using Microsoft.EntityFrameworkCore;
 
-namespace CA.Infrastructure.Data
+namespace Infrastructure.Data
 {
     public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(options)
     {

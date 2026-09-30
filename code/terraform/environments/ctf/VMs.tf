@@ -46,11 +46,13 @@ resource "proxmox_virtual_environment_file" "cloud_init_vendor" {
 *  Cloud-Image Download
 *  -------------------------------------------------------------- */
 resource "proxmox_download_file" "cloud_image" {
-  content_type = "iso"
-  datastore_id = var.cloud_image.datastore_id
-  node_name    = var.vm_defaults.node_name
-  url          = var.cloud_image.url
-  file_name    = var.cloud_image.file_name
+  content_type        = "iso"
+  datastore_id        = var.cloud_image.datastore_id
+  node_name           = var.vm_defaults.node_name
+  url                 = var.cloud_image.url
+  file_name           = var.cloud_image.file_name
+  overwrite_unmanaged = true
+  overwrite           = true
 }
 
 /* --------------------------------------------------------------
