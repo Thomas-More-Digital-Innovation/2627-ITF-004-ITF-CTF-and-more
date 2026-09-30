@@ -1,0 +1,21 @@
+# Local working directory
+.terraform/
+
+# Local state files
+*.tfstate
+*.tfstate.*
+
+# Crash logs
+crash.log
+crash.*.log
+
+# Sensitive variable files
+*.tfvars
+*.tfvars.json
+.r2-credentials
+
+# Override files
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
