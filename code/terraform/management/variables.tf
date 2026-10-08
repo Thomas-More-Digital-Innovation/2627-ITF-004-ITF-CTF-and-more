@@ -2,6 +2,7 @@ variable "proxmox_connection" {
   description = "Proxmox connection settings. Use either username/password or api_token."
   type = object({
     endpoint  = string
+    insecure  = optional(bool, true)
     username  = optional(string)
     password  = optional(string)
     api_token = optional(string)
@@ -34,11 +35,11 @@ variable "cloud_image" {
   type = object({
     url          = string
     file_name    = string
-    datastore_id = optional(string, "truenas-isos")
+    datastore_id = optional(string, "local")
   })
   default = {
     url          = "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2"
     file_name    = "debian-12-generic-amd64.img"
-    datastore_id = "truenas-isos"
+    datastore_id = "local"
   }
 }

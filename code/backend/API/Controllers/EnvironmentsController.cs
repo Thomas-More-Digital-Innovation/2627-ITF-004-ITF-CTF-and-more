@@ -17,7 +17,7 @@ namespace API.Controllers
             }
 
             try
-            {
+            {                
                 var result = await environmentService.ApplyEnvironmentAsync(environmentName);
                 return Ok(new { Output = result });
             }

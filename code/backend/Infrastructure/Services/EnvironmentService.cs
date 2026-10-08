@@ -22,13 +22,25 @@ namespace Infrastructure.Services
                 EnvironmentVariables = new System.Collections.Generic.Dictionary<string, string?>
                 {
                     { "PULUMI_BACKEND_URL", "file://~" },
-                    { "PULUMI_CONFIG_PASSPHRASE", "default_passphrase" } // Required for local state secrets manager
+                    { "PULUMI_CONFIG_PASSPHRASE", "default_passphrase" }, // Required for local state secrets manager
+                    { "PROXMOX_VE_INSECURE", "true" }
                 }
             };
             
             var workspace = await LocalWorkspace.CreateAsync(workspaceArgs);
             await workspace.InstallAsync();
             var stack = await WorkspaceStack.CreateOrSelectAsync(stackName, workspace);
+
+            try
+            {
+                await stack.CancelAsync();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Pulumi cancel notice: {ex.Message}");
+            }
+
+            await stack.RefreshAsync(new RefreshOptions { OnStandardOutput = Console.WriteLine });
 
             var result = await stack.UpAsync(new UpOptions { OnStandardOutput = Console.WriteLine });
 

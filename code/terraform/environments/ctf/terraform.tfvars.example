@@ -1,5 +1,6 @@
 proxmox_connection = {
   endpoint = "https://pve.be:8006"
+  insecure = true
 
   # Use either:
   # username = "your-user"
@@ -17,5 +18,8 @@ vm_defaults = {
 cloud_image = {
   url          = "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2"
   file_name    = "debian-12-generic-amd64.img"
-  datastore_id = "truenas-isos"
+  datastore_id = "local"
 }
+
+vnet_name = "envs"
+vlan_id   = 100

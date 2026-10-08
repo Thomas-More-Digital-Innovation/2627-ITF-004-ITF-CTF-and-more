@@ -1,10 +1,24 @@
 <script setup lang="ts">
 import { ref } from 'vue'
+import { getHello } from '../api'
 import heroImg from '../assets/hero.png'
 import viteLogo from '../assets/vite.svg'
 import vueLogo from '../assets/vue.svg'
 
 const count = ref(0)
+const apiResponse = ref<any>(null)
+const apiError = ref<string | null>(null)
+
+const callApi = async () => {
+  apiError.value = null
+  try {
+    const data = await getHello()
+    apiResponse.value = data
+  } catch (error: any) {
+    apiError.value = error.message || 'Failed to call API'
+    console.error(error)
+  }
+}
 </script>
 
 <template>
@@ -21,6 +35,17 @@ const count = ref(0)
     <button type="button" class="counter" @click="count++">
       Count is {{ count }}
     </button>
+    <div style="margin-top: 2rem;">
+      <button type="button" @click="callApi">
+        Call API
+      </button>
+      <div v-if="apiResponse" style="margin-top: 1rem; text-align: left; background-color: #222; padding: 1rem; border-radius: 8px; overflow-x: auto;">
+        <pre><code>{{ apiResponse }}</code></pre>
+      </div>
+      <div v-if="apiError" style="margin-top: 1rem; color: #ff4d4f;">
+        <p>{{ apiError }}</p>
+      </div>
+    </div>
   </section>
 
   <div class="ticks"></div>

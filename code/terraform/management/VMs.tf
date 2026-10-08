@@ -9,6 +9,7 @@ terraform {
 
 provider "proxmox" {
   endpoint  = var.proxmox_connection.endpoint
+  insecure  = try(var.proxmox_connection.insecure, true)
   api_token = try(trimspace(var.proxmox_connection.api_token), null) != "" ? var.proxmox_connection.api_token : null
   username  = try(trimspace(var.proxmox_connection.username), null) != "" ? var.proxmox_connection.username : null
   password  = try(trimspace(var.proxmox_connection.password), null) != "" ? var.proxmox_connection.password : null
@@ -91,7 +92,7 @@ resource "proxmox_virtual_environment_vm" "TEST-VM-VAN-DAVID" {
   }
 
   disk {
-    datastore_id = "local-vm"
+    datastore_id = "sas-disks"
     file_id      = proxmox_download_file.cloud_image.id
     interface    = "scsi0"
     size         = 16
@@ -99,7 +100,7 @@ resource "proxmox_virtual_environment_vm" "TEST-VM-VAN-DAVID" {
   }
 
   efi_disk {
-    datastore_id      = "local-vm"
+    datastore_id      = "sas-disks"
     file_format       = "raw"
     type              = "4m"
     pre_enrolled_keys = true
@@ -114,7 +115,7 @@ resource "proxmox_virtual_environment_vm" "TEST-VM-VAN-DAVID" {
   }
 
   initialization {
-    datastore_id = "local-vm"
+    datastore_id = "sas-disks"
 
     vendor_data_file_id = proxmox_virtual_environment_file.cloud_init_vendor.id
 
