@@ -18,8 +18,9 @@ vm_defaults = {
 cloud_image = {
   url          = "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2"
   file_name    = "debian-12-generic-amd64.img"
-  datastore_id = "local"
+  datastore_id = "local-lvm"
 }
 
 vnet_name = "envs"
-vlan_id   = 100
+# vlan_id is passed dynamically by the .NET backend / management platform
+# vlan_id   = 100

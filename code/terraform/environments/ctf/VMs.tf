@@ -32,8 +32,8 @@ resource "proxmox_download_file" "talos_iso" {
   content_type        = "iso"
   datastore_id        = "local"
   node_name           = var.vm_defaults.node_name
-  url                 = "https://github.com/siderolabs/talos/releases/download/v1.14.2/metal-amd64.iso"
-  file_name           = "talos-v1.7.6-amd64.iso"
+  url                 = "https://factory.talos.dev/image/ce4c980550dd2ab1b17bbf2b08801c7eb59418eafe8f279833297925d67c7515/v1.7.6/metal-amd64.iso"
+  file_name           = "talos-v1.7.6-qemu-guest-agent.iso"
   overwrite_unmanaged = true
 }
 
@@ -190,6 +190,19 @@ data "talos_machine_configuration" "controlplane" {
   cluster_endpoint = "https://${proxmox_virtual_environment_vm.master[0].ipv4_addresses[1][0]}:6443"
   machine_type     = "controlplane"
   machine_secrets  = talos_machine_secrets.this.machine_secrets
+  config_patches = [
+    yamlencode({
+      machine = {
+        install = {
+          extensions = [
+            {
+              image = "ghcr.io/siderolabs/qemu-guest-agent:v8.2.0"
+            }
+          ]
+        }
+      }
+    })
+  ]
 }
 
 data "talos_machine_configuration" "worker" {
@@ -197,6 +210,19 @@ data "talos_machine_configuration" "worker" {
   cluster_endpoint = "https://${proxmox_virtual_environment_vm.master[0].ipv4_addresses[1][0]}:6443"
   machine_type     = "worker"
   machine_secrets  = talos_machine_secrets.this.machine_secrets
+  config_patches = [
+    yamlencode({
+      machine = {
+        install = {
+          extensions = [
+            {
+              image = "ghcr.io/siderolabs/qemu-guest-agent:v8.2.0"
+            }
+          ]
+        }
+      }
+    })
+  ]
 }
 
 resource "talos_machine_configuration_apply" "controlplane" {

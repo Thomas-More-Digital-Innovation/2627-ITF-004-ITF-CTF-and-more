@@ -40,7 +40,7 @@ variable "cloud_image" {
   default = {
     url          = "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2"
     file_name    = "debian-12-generic-amd64.img"
-    datastore_id = "local"
+    datastore_id = "local-lvm"
   }
 }
 
@@ -51,7 +51,7 @@ variable "vnet_name" {
 }
 
 variable "vlan_id" {
-  description = "The VLAN tag for the environment"
+  description = "The VLAN tag for the environment, dynamically passed by the .NET backend"
   type        = number
   default     = 100
 }

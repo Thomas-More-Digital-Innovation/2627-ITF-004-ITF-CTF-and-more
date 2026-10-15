@@ -1,0 +1,14 @@
+{
+  "Name": "terraform-provider",
+  "Kind": "resource",
+  "Version": "1.4.0",
+  "PluginDownloadURL": "",
+  "Checksums": null,
+  "Parameterization": {
+    "Name": "opnsense",
+    "Version": "0.26.0",
+    "Value": "eyJyZW1vdGUiOnsidXJsIjoicmVnaXN0cnkub3BlbnRvZnUub3JnL2Jyb3duaW5nbHVrZS9vcG5zZW5zZSIsInZlcnNpb24iOiIwLjI2LjAifX0="
+  },
+  "ExtensionParameterization": null,
+  "source": "registry.opentofu.org/browningluke/opnsense"
+}

@@ -1,4 +1,7 @@
+using Infrastructure;
+
 var builder = WebApplication.CreateBuilder(args);
+
 
 // Add services to the container.
 // Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
@@ -9,7 +12,8 @@ builder.Services.AddRouting(options => options.LowercaseUrls = true);
 
 builder.Services.AddControllers();
 
-builder.Services.AddScoped<Application.Interfaces.IEnvironmentService, Infrastructure.Services.EnvironmentService>();
+builder.Services.AddInfrastructure();
+
 
 // API documentation
 builder.Services.AddOpenApi();

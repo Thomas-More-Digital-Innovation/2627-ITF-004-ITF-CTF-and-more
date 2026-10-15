@@ -1,0 +1,4 @@
+name: management-hcl
+runtime: hcl
+description: Management and Platform Pulumi HCL project
+
