@@ -23,19 +23,10 @@ spec:
           args:
             - --addr
             - tcp://127.0.0.1:1234
-            - --oci-worker=false
-            - --containerd-worker=true
-            - --containerd-worker-addr=/run/containerd/containerd.sock
-            - --containerd-worker-namespace=k8s.io
+            - --oci-worker=true
+            - --containerd-worker=false
           securityContext:
             privileged: true
-          volumeMounts:
-            - name: containerd-sock
-              mountPath: /run/containerd/containerd.sock
-            - name: containerd-root
-              mountPath: /var/lib/containerd
-            - name: buildkit-root
-              mountPath: /var/lib/buildkit
         - name: sync
           image: python:3.11-slim
           envFrom:
@@ -52,6 +43,8 @@ spec:
           volumeMounts:
             - name: containerd-sock
               mountPath: /run/containerd/containerd.sock
+            - name: containerd-root
+              mountPath: /var/lib/containerd
           command:
             - /bin/bash
             - -ce
@@ -66,6 +59,7 @@ spec:
               chmod +x /usr/local/bin/kubectl
 
               curl -fsSL "https://github.com/moby/buildkit/releases/download/v0.16.0/buildkit-v0.16.0.linux-amd64.tar.gz" | tar -xz -C /usr/local bin/buildctl
+              curl -fsSL "https://github.com/containerd/nerdctl/releases/download/v1.7.7/nerdctl-1.7.7-linux-amd64.tar.gz" | tar -xz -C /usr/local/bin nerdctl
 
               pip install --no-cache-dir ctfcli requests pyyaml
 
@@ -213,12 +207,10 @@ spec:
 
                   print(f"\n[*] Building {name} ({rel_path}) -> {image_ref} ...")
                   build_cmd = [
-                      "buildctl", "build",
-                      "--frontend", "dockerfile.v0",
-                      "--local", f"context={build_ctx}",
-                      "--local", f"dockerfile={build_ctx}",
-                      "--opt", f"filename={dockerfile_name}",
-                      "--output", f"type=image,name={image_ref},unpack=true",
+                      "nerdctl", "--namespace", "k8s.io", "build",
+                      "-t", image_ref,
+                      "-f", str(build_ctx / dockerfile_name),
+                      str(build_ctx),
                   ]
                   res = subprocess.run(build_cmd)
                   if res.returncode != 0:
@@ -329,8 +321,4 @@ spec:
           hostPath:
             path: /var/lib/containerd
             type: Directory
-        - name: buildkit-root
-          hostPath:
-            path: /var/lib/buildkit
-            type: DirectoryOrCreate
 
