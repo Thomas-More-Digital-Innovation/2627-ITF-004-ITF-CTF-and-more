@@ -1,6 +1,8 @@
 # In-cluster Job that automatically initializes CTFd (if not yet set up),
 # mints an admin token directly from CTFd, clones the private GitLab challenges repo,
-# and imports/syncs all challenges via ctfcli.
+# imports/syncs all static challenges via ctfcli, and builds containerized challenges
+# locally into containerd (k8s.io namespace, peered across all nodes by Spegel)
+# and registers them as on-demand per-player dynamic_iac challenges in CTFd.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -18,6 +20,22 @@ spec:
       serviceAccountName: chall-manager
       restartPolicy: OnFailure
       containers:
+        - name: buildkitd
+          image: moby/buildkit:v0.16.0
+          args:
+            - --addr
+            - tcp://127.0.0.1:1234
+            - --oci-worker=false
+            - --containerd-worker=true
+            - --containerd-worker-addr=/run/containerd/containerd.sock
+            - --containerd-worker-namespace=k8s.io
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: containerd-sock
+              mountPath: /run/containerd/containerd.sock
+            - name: containerd-root
+              mountPath: /var/lib/containerd
         - name: sync
           image: python:3.11-slim
           envFrom:
@@ -27,18 +45,38 @@ spec:
           env:
             - name: CTFD_URL
               value: "http://ctfd-web.ctf.svc.cluster.local:8000"
+            - name: BUILDKIT_HOST
+              value: "tcp://127.0.0.1:1234"
+            - name: CHALLENGE_HOST
+              value: "10.100.0.50"
+          volumeMounts:
+            - name: containerd-sock
+              mountPath: /run/containerd/containerd.sock
           command:
             - /bin/bash
             - -ce
             - |
-              apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates && rm -rf /var/lib/apt/lists/*
+              cleanup() {
+                kubectl exec -n ctf "$HOSTNAME" -c buildkitd -- kill 1 2>/dev/null || true
+              }
+              trap cleanup EXIT
+
+              apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates tar && rm -rf /var/lib/apt/lists/*
               curl -fsSL "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl
               chmod +x /usr/local/bin/kubectl
+
+              curl -fsSL "https://github.com/moby/buildkit/releases/download/v0.16.0/buildkit-v0.16.0.linux-amd64.tar.gz" | tar -xz -C /usr/local bin/buildctl
+
               pip install --no-cache-dir ctfcli requests pyyaml
 
               echo "[*] Waiting for CTFd at ${CTFD_URL}..."
               until curl -sf "${CTFD_URL}/healthcheck" > /dev/null; do
                 sleep 3
+              done
+
+              echo "[*] Waiting for local BuildKit containerd worker..."
+              until buildctl debug workers > /dev/null 2>&1; do
+                sleep 2
               done
 
               if [ -z "${GITLAB_TOKEN:-}" ]; then
@@ -47,14 +85,16 @@ spec:
               fi
 
               python3 - << 'PYEOF'
-              import os, re, subprocess, sys
+              import json, os, re, subprocess, sys
               from pathlib import Path
               import requests
+              import yaml
 
               ctfd_url = os.environ["CTFD_URL"].rstrip("/")
               admin_user = os.environ.get("CTFD_ADMIN_USER", "admin")
               admin_email = os.environ.get("CTFD_ADMIN_EMAIL", "admin@ctf.local")
               admin_password = os.environ.get("CTFD_ADMIN_PASSWORD", "admin")
+              challenge_host = os.environ.get("CHALLENGE_HOST", "10.100.0.50")
               repo_url = os.environ.get(
                   "CHALLENGES_REPO_URL",
                   "https://gitlab.com/it-factory-thomas-more/SKIL3/25-26/bsides-ctf/challenges.git",
@@ -87,7 +127,7 @@ spec:
               else:
                   print("[*] CTFd already initialized.")
 
-              # 2. Mint an admin API token directly inside the CTFd pod (works regardless of UI password)
+              # 2. Mint an admin API token directly inside the CTFd pod
               mint_cmd = [
                   "kubectl", "exec", "-n", "ctf", "deploy/ctfd", "--",
                   "python3", "-c",
@@ -106,17 +146,179 @@ spec:
               access_token = re.search(r"MINTED_TOKEN=(\S+)", mint_out).group(1)
               print("[*] Minted CTFd admin API token successfully.")
 
+              api_headers = {
+                  "Authorization": f"Token {access_token}",
+                  "Content-Type": "application/json",
+              }
+
               # 3. Clone private GitLab challenges repo
               authed_url = repo_url.replace("https://", f"https://{gitlab_user}:{gitlab_token}@")
               work_dir = Path("/tmp/challenges")
               subprocess.run(["git", "clone", "--depth=1", authed_url, str(work_dir)], check=True)
 
-              # 4. Write .ctf/config and run ctfd-cli-autorun_all_teams.py
+              # 4. Write .ctf/config and run ctfd-cli-autorun_all_teams.py for all static/standard challenges
               ctf_dir = work_dir / ".ctf"
               ctf_dir.mkdir(exist_ok=True)
               (ctf_dir / "config").write_text(
                   f"[config]\nurl = {ctfd_url}\naccess_token = {access_token}\n\n[challenges]\n"
               )
+              subprocess.run([sys.executable, "ctfd-cli-autorun_all_teams.py"], cwd=work_dir, check=False)
 
-              subprocess.run([sys.executable, "ctfd-cli-autorun_all_teams.py"], cwd=work_dir, check=True)
+              # 5. Build containerized challenges locally into containerd (k8s.io, peered via Spegel)
+              #    and convert them to dynamic_iac challenges in CTFd + chall-manager
+              DYNAMIC_CHALLENGES = [
+                  ("Team A1/The-13th-Cabin", ".", "Dockerfile", 5000, "http", None),
+                  ("Team A1/camp-forest-green-found-footage", "web", "Dockerfile", 5000, "http", None),
+                  ("Team A1/crystal_lake", ".", "Dockerfile", 80, "http", None),
+                  ("Team A1/devils-jackpot", ".", "Dockerfile", 5000, "http", None),
+                  ("Team A1/flappy bird", ".", "Dockerfile", 80, "http", None),
+                  ("Team A1/linux-jail-escape", "jail", "Dockerfile", 80, "http", ["/usr/local/bin/ttyd", "-p", "80", "su", "-", "prisoner"]),
+                  ("Team A1/path-traversal-challenge", ".", "Dockerfile", 3000, "http", None),
+                  ("Team A1/physical_puzzle", ".", "Dockerfile", 80, "http", None),
+                  ("Team A1/spectral-challenge", "web", "Dockerfile", 5000, "http", None),
+                  ("Team A1/whitespace-challenge", "web", "Dockerfile", 80, "http", None),
+                  ("Team A2/windows master quest", ".", "Dockerfile", 5000, "http", None),
+                  ("Team A3/Misc_Character_Guessing", "assets", "Dockerfile", 3000, "http", None),
+                  ("Team A3/PWN_Priv_Escalation_Part-1", "assets", "Dockerfile", 22, "ssh", None),
+                  ("Team A3/PWN_Priv_Escalation_Part-2", "assets", "Dockerfile", 22, "ssh", None),
+                  ("Team A3/Web_Client_Auth", "assets", "Dockerfile", 80, "http", None),
+                  ("Team A3/Web_Command_Injection", "assets", "Dockerfile", 5000, "http", None),
+                  ("Team A3/Web_Redirecting", "assets", "Dockerfile", 3000, "http", None),
+              ]
+
+              existing_resp = requests.get(f"{ctfd_url}/api/v1/challenges?view=admin", headers=api_headers)
+              existing_resp.raise_for_status()
+              existing_by_name = {c["name"]: c for c in existing_resp.json().get("data", [])}
+
+              for rel_path, ctx_subdir, dockerfile_name, port, proto, cmd_override in DYNAMIC_CHALLENGES:
+                  chall_dir = work_dir / rel_path
+                  chall_yml = chall_dir / "challenge.yml"
+                  if not chall_yml.exists():
+                      print(f"[!] Missing {chall_yml}, skipping")
+                      continue
+
+                  meta = yaml.safe_load(chall_yml.read_text())
+                  name = meta["name"]
+                  slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+                  image_ref = f"ctf.local/challenges/{slug}:latest"
+                  build_ctx = chall_dir / ctx_subdir
+
+                  print(f"\n[*] Building {name} ({rel_path}) -> {image_ref} ...")
+                  build_cmd = [
+                      "buildctl", "build",
+                      "--frontend", "dockerfile.v0",
+                      "--local", f"context={build_ctx}",
+                      "--local", f"dockerfile={build_ctx}",
+                      "--opt", f"filename={dockerfile_name}",
+                      "--output", f"type=image,name={image_ref},unpack=true",
+                  ]
+                  res = subprocess.run(build_cmd)
+                  if res.returncode != 0:
+                      print(f"[!] Build failed for {name}, keeping existing challenge entry.")
+                      continue
+
+                  # Remove old 'standard' challenge of the same name so we can replace with 'dynamic_iac'
+                  old = existing_by_name.get(name)
+                  if old and old.get("type") != "dynamic_iac":
+                      print(f"[*] Converting '{name}' (id={old['id']}) from {old.get('type')} to dynamic_iac...")
+                      requests.delete(f"{ctfd_url}/api/v1/challenges/{old['id']}", headers=api_headers)
+                      old = None
+
+                  additional_cfg = {
+                      "image": image_ref,
+                      "port": str(port),
+                      "protocol": proto,
+                      "host": challenge_host,
+                  }
+                  if cmd_override:
+                      additional_cfg["command"] = json.dumps(cmd_override)
+
+                  val = int(meta.get("value", 100))
+                  payload = {
+                      "name": name,
+                      "category": meta.get("category", "Misc"),
+                      "description": meta.get("description", ""),
+                      "attribution": meta.get("attribution", meta.get("author", "")),
+                      "value": val,
+                      "initial": val,
+                      "minimum": val,
+                      "decay": 100,
+                      "function": "linear",
+                      "state": meta.get("state", "visible"),
+                      "type": "dynamic_iac",
+                      "scenario": "localhost:5000/scenarios/k8s-monopod:latest",
+                      "timeout": 900,
+                      "destroy_on_flag": True,
+                      "shared": False,
+                      "mana_cost": 0,
+                      "additional": json.dumps(additional_cfg),
+                  }
+
+                  if old and old.get("type") == "dynamic_iac":
+                      cid = old["id"]
+                      r = requests.patch(f"{ctfd_url}/api/v1/challenges/{cid}", headers=api_headers, json=payload)
+                      r.raise_for_status()
+                      print(f"[+] Updated dynamic_iac challenge '{name}' (id={cid})")
+                      continue
+
+                  r = requests.post(f"{ctfd_url}/api/v1/challenges", headers=api_headers, json=payload)
+                  if not r.ok:
+                      print(f"[!] Failed to create dynamic_iac challenge '{name}': {r.status_code} {r.text}")
+                      continue
+                  cid = r.json()["data"]["id"]
+                  print(f"[+] Created dynamic_iac challenge '{name}' (id={cid})")
+
+                  # Attach flags
+                  for fl in meta.get("flags", []):
+                      if isinstance(fl, str):
+                          fl_payload = {"challenge_id": cid, "type": "static", "content": fl, "data": ""}
+                      else:
+                          fl_payload = {
+                              "challenge_id": cid,
+                              "type": fl.get("type", "static"),
+                              "content": fl.get("content", ""),
+                              "data": fl.get("data", ""),
+                          }
+                      requests.post(f"{ctfd_url}/api/v1/flags", headers=api_headers, json=fl_payload)
+
+                  # Attach tags
+                  for tg in meta.get("tags", []):
+                      val_tg = tg.get("value") if isinstance(tg, dict) else str(tg)
+                      requests.post(f"{ctfd_url}/api/v1/tags", headers=api_headers, json={"challenge_id": cid, "value": val_tg})
+
+                  # Attach hints
+                  for ht in meta.get("hints", []) or meta.get("hint", []):
+                      if isinstance(ht, str):
+                          ht_payload = {"challenge_id": cid, "content": ht, "cost": 0}
+                      else:
+                          ht_payload = {
+                              "challenge_id": cid,
+                              "content": ht.get("content", ""),
+                              "cost": int(ht.get("cost", 0)),
+                          }
+                          if ht.get("title"):
+                              ht_payload["title"] = ht["title"]
+                      requests.post(f"{ctfd_url}/api/v1/hints", headers=api_headers, json=ht_payload)
+
+                  # Attach downloadable files
+                  for fpath in meta.get("files", []):
+                      full_f = chall_dir / fpath
+                      if full_f.exists():
+                          with full_f.open("rb") as fp:
+                              requests.post(
+                                  f"{ctfd_url}/api/v1/files",
+                                  headers={"Authorization": f"Token {access_token}"},
+                                  files={"file": (full_f.name, fp)},
+                                  data={"challenge_id": cid, "type": "challenge"},
+                              )
               PYEOF
+      volumes:
+        - name: containerd-sock
+          hostPath:
+            path: /run/containerd/containerd.sock
+            type: Socket
+        - name: containerd-root
+          hostPath:
+            path: /var/lib/containerd
+            type: Directory
+
