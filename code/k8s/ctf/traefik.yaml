@@ -16,7 +16,8 @@ spec:
     helm:
       valuesObject:
         service:
-          type: NodePort
+          spec:
+            type: NodePort
         ports:
           web:
             nodePort: 30080
