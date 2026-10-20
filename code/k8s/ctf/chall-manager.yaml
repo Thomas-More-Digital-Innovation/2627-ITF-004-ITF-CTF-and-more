@@ -1,0 +1,93 @@
+# On-demand per-player/per-team challenge instancer (ctfer-io/chall-manager)
+# Exposes HTTP/gRPC on port 8080 for CTFd (ctfd-chall-manager plugin) or the .NET backend
+# to dynamically spin up and expire isolated challenge pods/services per team.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: chall-manager
+  namespace: ctf
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: chall-manager-role
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces", "pods", "services", "secrets", "configmaps", "persistentvolumeclaims"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses", "networkpolicies"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: chall-manager-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: chall-manager-role
+subjects:
+  - kind: ServiceAccount
+    name: chall-manager
+    namespace: ctf
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chall-manager
+  namespace: ctf
+  labels:
+    app.kubernetes.io/name: chall-manager
+    app.kubernetes.io/part-of: ctf-instancer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: chall-manager
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: chall-manager
+        app.kubernetes.io/part-of: ctf-instancer
+    spec:
+      serviceAccountName: chall-manager
+      containers:
+        - name: chall-manager
+          image: ctferio/chall-manager:v0.4.2
+          ports:
+            - name: http
+              containerPort: 8080
+          volumeMounts:
+            - name: state
+              mountPath: /tmp/chall-manager
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: state
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: chall-manager
+  namespace: ctf
+  labels:
+    app.kubernetes.io/name: chall-manager
+    app.kubernetes.io/part-of: ctf-instancer
+spec:
+  selector:
+    app.kubernetes.io/name: chall-manager
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+

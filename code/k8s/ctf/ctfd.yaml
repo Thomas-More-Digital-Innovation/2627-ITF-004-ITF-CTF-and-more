@@ -1,0 +1,61 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ctfd
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://charts.pascaliske.dev
+    chart: ctfd
+    targetRevision: 2.0.0
+    helm:
+      valuesObject:
+        controller:
+          replicas: 1
+        service:
+          type: NodePort
+        ports:
+          http:
+            enabled: true
+            port: 8000
+            nodePort: 30080
+        # Disabled until a StorageClass is provisioned on the Talos cluster
+        persistentVolumeClaim:
+          create: false
+        env:
+          - name: TZ
+            value: UTC
+          - name: DATABASE_URL
+            value: sqlite:////data/ctfd.db
+          - name: UPLOAD_FOLDER
+            value: /var/uploads
+          - name: LOG_FOLDER
+            value: /var/log/CTFd
+          - name: REVERSE_PROXY
+            value: "true"
+        extraVolumes:
+          - name: ctfd-data
+            emptyDir: {}
+          - name: ctfd-uploads
+            emptyDir: {}
+          - name: ctfd-logs
+            emptyDir: {}
+        extraVolumeMounts:
+          - name: ctfd-data
+            mountPath: /data
+          - name: ctfd-uploads
+            mountPath: /var/uploads
+          - name: ctfd-logs
+            mountPath: /var/log/CTFd
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: ctf
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
