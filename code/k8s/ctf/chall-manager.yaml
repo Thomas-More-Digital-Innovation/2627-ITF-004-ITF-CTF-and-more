@@ -13,7 +13,7 @@ metadata:
   name: chall-manager-role
 rules:
   - apiGroups: [""]
-    resources: ["namespaces", "pods", "services", "secrets", "configmaps", "persistentvolumeclaims"]
+    resources: ["namespaces", "pods", "pods/exec", "services", "secrets", "configmaps", "persistentvolumeclaims"]
     verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
   - apiGroups: ["apps"]
     resources: ["deployments", "statefulsets"]

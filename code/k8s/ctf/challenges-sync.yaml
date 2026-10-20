@@ -1,5 +1,6 @@
 # In-cluster Job that automatically initializes CTFd (if not yet set up),
-# clones the private GitLab challenges repo, and imports/syncs all challenges via ctfcli.
+# mints an admin token directly from CTFd, clones the private GitLab challenges repo,
+# and imports/syncs all challenges via ctfcli.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -9,10 +10,12 @@ metadata:
     argocd.argoproj.io/sync-wave: "2"
     argocd.argoproj.io/hook: PostSync
     argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-options: Replace=true
 spec:
   backoffLimit: 5
   template:
     spec:
+      serviceAccountName: chall-manager
       restartPolicy: OnFailure
       containers:
         - name: sync
@@ -28,7 +31,9 @@ spec:
             - /bin/bash
             - -ce
             - |
-              apt-get update && apt-get install -y --no-install-recommends git curl && rm -rf /var/lib/apt/lists/*
+              apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates && rm -rf /var/lib/apt/lists/*
+              curl -fsSL "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl
+              chmod +x /usr/local/bin/kubectl
               pip install --no-cache-dir ctfcli requests pyyaml
 
               echo "[*] Waiting for CTFd at ${CTFD_URL}..."
@@ -63,9 +68,9 @@ spec:
               r = session.get(f"{ctfd_url}/setup", allow_redirects=False)
               if r.status_code == 200:
                   print("[*] Performing initial CTFd setup...")
-                  nonce_match = re.search(r'name="nonce"[^>]*value="([^"]+)"', r.text)
+                  nonce_match = re.search(r"['\"]?csrfNonce['\"]?\s*:\s*['\"]([^'\"]+)['\"]", r.text)
                   if not nonce_match:
-                      nonce_match = re.search(r"csrfNonce\s*:\s*['\"]([^'\"]+)['\"]", r.text)
+                      nonce_match = re.search(r'name="nonce"[^>]*value="([^"]+)"', r.text)
                   nonce = nonce_match.group(1)
                   setup_data = {
                       "ctf_name": "CyberKit CTF",
@@ -80,25 +85,26 @@ spec:
                   resp = session.post(f"{ctfd_url}/setup", data=setup_data)
                   resp.raise_for_status()
               else:
-                  print("[*] CTFd already initialized, logging in...")
-                  login_page = session.get(f"{ctfd_url}/login")
-                  nonce = re.search(r'name="nonce"[^>]*value="([^"]+)"', login_page.text).group(1)
-                  resp = session.post(
-                      f"{ctfd_url}/login",
-                      data={"name": admin_user, "password": admin_password, "nonce": nonce},
-                  )
-                  resp.raise_for_status()
+                  print("[*] CTFd already initialized.")
 
-              # 2. Generate API token for ctfcli
-              settings_page = session.get(f"{ctfd_url}/settings")
-              csrf = re.search(r"csrfNonce\s*:\s*['\"]([^'\"]+)['\"]", settings_page.text).group(1)
-              tok_resp = session.post(
-                  f"{ctfd_url}/api/v1/tokens",
-                  headers={"CSRF-Token": csrf, "Content-Type": "application/json"},
-                  json={"expiration": "2099-01-01", "description": "in-cluster-ctfcli-sync"},
-              )
-              tok_resp.raise_for_status()
-              access_token = tok_resp.json()["data"]["value"]
+              # 2. Mint an admin API token directly inside the CTFd pod (works regardless of UI password)
+              mint_cmd = [
+                  "kubectl", "exec", "-n", "ctf", "deploy/ctfd", "--",
+                  "python3", "-c",
+                  (
+                      "from CTFd import create_app; "
+                      "from CTFd.models import Users; "
+                      "from CTFd.utils.security.auth import generate_user_token; "
+                      "app = create_app()\n"
+                      "with app.app_context():\n"
+                      "    admin = Users.query.filter_by(type='admin').first()\n"
+                      "    tok = generate_user_token(admin, expiration=None, description='in-cluster-ctfcli-sync')\n"
+                      "    print('MINTED_TOKEN=' + tok.value)\n"
+                  ),
+              ]
+              mint_out = subprocess.check_output(mint_cmd, text=True)
+              access_token = re.search(r"MINTED_TOKEN=(\S+)", mint_out).group(1)
+              print("[*] Minted CTFd admin API token successfully.")
 
               # 3. Clone private GitLab challenges repo
               authed_url = repo_url.replace("https://", f"https://{gitlab_user}:{gitlab_token}@")
@@ -114,4 +120,3 @@ spec:
 
               subprocess.run([sys.executable, "ctfd-cli-autorun_all_teams.py"], cwd=work_dir, check=True)
               PYEOF
-

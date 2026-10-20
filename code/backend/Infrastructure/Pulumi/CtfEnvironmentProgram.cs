@@ -237,6 +237,8 @@ namespace Infrastructure.Pulumi
             var k8sProvider = new K8s.Provider("k8s-provider", new K8s.ProviderArgs
             {
                 KubeConfig = kubeconfig.KubeconfigRaw,
+                EnableServerSideApply = true,
+                UpsertExistingObjects = true,
             }, new CustomResourceOptions { DependsOn = { kubeconfig } });
 
             var certManagerRelease = new Release("cert-manager", new ReleaseArgs
