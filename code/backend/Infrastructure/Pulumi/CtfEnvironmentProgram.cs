@@ -4,10 +4,15 @@ using Pulumi.ProxmoxVE.Inputs;
 using DownloadFile = Pulumi.ProxmoxVE.Download.File;
 using DownloadFileArgs = Pulumi.ProxmoxVE.Download.FileArgs;
 using TalosClient = Pulumiverse.Talos.Client;
+using TalosCluster = Pulumiverse.Talos.Cluster;
 using TalosInputs = Pulumiverse.Talos.Machine.Inputs;
 using Pulumiverse.Talos.Machine;
 using Machines = Pulumiverse.Talos.Machine;
 using TalosSecrets = Pulumiverse.Talos.Machine.Secrets;
+using K8s = Pulumi.Kubernetes;
+using Pulumi.Kubernetes.Helm.V3;
+using Pulumi.Kubernetes.Types.Inputs.Helm.V3;
+using Pulumi.Kubernetes.Types.Inputs.Meta.V1;
 
 namespace Infrastructure.Pulumi
 {
@@ -26,6 +31,47 @@ namespace Infrastructure.Pulumi
         public string[] Tags { get; set; } = ["pulumi"];
     }
 
+    public class CtfClusterOptions
+    {
+        public const string SectionName = "CtfCluster";
+
+        public string CertManagerVersion { get; set; } = "v1.17.1";
+        public string ArgoCdVersion { get; set; } = "7.8.2";
+        public List<ArgoCdApplicationConfig> Applications { get; set; } = [];
+
+        public static List<ArgoCdApplicationConfig> DefaultApplications =>
+        [
+            new ArgoCdApplicationConfig
+            {
+                Name = "ctf-apps",
+                Namespace = "argocd",
+                Project = "default",
+                RepoUrl = "https://github.com/Thomas-More-Digital-Innovation/2627-ITF-004-ITF-CTF-and-more.git",
+                TargetRevision = "HEAD",
+                Path = "code/k8s/ctf",
+                DestinationServer = "https://kubernetes.default.svc",
+                DestinationNamespace = "ctf",
+                CreateNamespace = true,
+                AutomatedSync = true,
+            }
+        ];
+    }
+
+    public class ArgoCdApplicationConfig
+    {
+        public string Name { get; set; } = string.Empty;
+        public string Namespace { get; set; } = "argocd";
+        public string Project { get; set; } = "default";
+        public string RepoUrl { get; set; } = string.Empty;
+        public string TargetRevision { get; set; } = "HEAD";
+        public string? Path { get; set; }
+        public string? Chart { get; set; }
+        public string DestinationServer { get; set; } = "https://kubernetes.default.svc";
+        public string DestinationNamespace { get; set; } = "default";
+        public bool CreateNamespace { get; set; } = true;
+        public bool AutomatedSync { get; set; } = true;
+    }
+
     /// <summary>
     /// C# Pulumi port of terraform/environments/ctf (Talos Kubernetes cluster on Proxmox).
     /// </summary>
@@ -34,6 +80,16 @@ namespace Infrastructure.Pulumi
         private const string TalosVersion = "v1.14.4";
         private const string TalosSchematicId = "ce4c980550dd2ab1b17bbf2b08801c7eb59418eafe8f279833297925d67c7515";
         private const string TalosIsoUrl = $"https://factory.talos.dev/image/{TalosSchematicId}/{TalosVersion}/nocloud-amd64.iso";
+
+        private sealed class ArgoCdApplicationResourceArgs : K8s.ApiExtensions.CustomResourceArgs
+        {
+            [Input("spec", required: true)]
+            public InputMap<object> Spec { get; set; } = new();
+
+            public ArgoCdApplicationResourceArgs() : base("argoproj.io/v1alpha1", "Application")
+            {
+            }
+        }
 
         private static string BuildNodePatch(string ipWithPrefix, string gatewayIp) =>
             $$"""
@@ -66,8 +122,13 @@ namespace Infrastructure.Pulumi
             }
             """;
 
-        public static Dictionary<string, object?> Run(ProxmoxOptions px, int vlanId, string cidr, string envName = "ctf", int masters = 3, int workers = 6)
+        public static Dictionary<string, object?> Run(ProxmoxOptions px, int vlanId, string cidr, string envName = "ctf", int masters = 3, int workers = 6, CtfClusterOptions? clusterOptions = null)
         {
+            var clusterOpts = clusterOptions ?? new CtfClusterOptions();
+            var applications = clusterOpts.Applications.Count > 0
+                ? clusterOpts.Applications
+                : CtfClusterOptions.DefaultApplications;
+
             var iso = new DownloadFile("talos_iso", new DownloadFileArgs
             {
                 ContentType = "iso",
@@ -130,7 +191,7 @@ namespace Infrastructure.Pulumi
                 Node = masterIps[i],
             }, new CustomResourceOptions { DependsOn = { vm } })).ToList();
 
-            _ = workerVms.Select((vm, i) => new ConfigurationApply($"worker-{i}", new ConfigurationApplyArgs
+            var workerApplies = workerVms.Select((vm, i) => new ConfigurationApply($"worker-{i}", new ConfigurationApplyArgs
             {
                 ClientConfiguration = ClientCfg(secrets),
                 MachineConfigurationInput = MachineConfig("worker", workerIps[i]),
@@ -138,17 +199,122 @@ namespace Infrastructure.Pulumi
                 Node = workerIps[i],
             }, new CustomResourceOptions { DependsOn = { vm } })).ToList();
 
-            _ = new Bootstrap("this", new BootstrapArgs
+            var bootstrap = new Bootstrap("this", new BootstrapArgs
             {
                 ClientConfiguration = ClientCfg(secrets),
                 Endpoint = firstMasterIp,
                 Node = firstMasterIp,
             }, new CustomResourceOptions { DependsOn = cpApplies.Cast<Resource>().ToList() });
 
+            var kubeconfig = new TalosCluster.Kubeconfig("this", new TalosCluster.KubeconfigArgs
+            {
+                ClientConfiguration = new TalosCluster.Inputs.KubeconfigClientConfigurationArgs
+                {
+                    CaCertificate = secrets.ClientConfiguration.Apply(c => c.CaCertificate),
+                    ClientCertificate = secrets.ClientConfiguration.Apply(c => c.ClientCertificate),
+                    ClientKey = secrets.ClientConfiguration.Apply(c => c.ClientKey),
+                },
+                Endpoint = firstMasterIp,
+                Node = firstMasterIp,
+            }, new CustomResourceOptions
+            {
+                DependsOn = new List<Resource> { bootstrap }.Concat(workerApplies).ToList(),
+            });
+
+            var k8sProvider = new K8s.Provider("k8s-provider", new K8s.ProviderArgs
+            {
+                KubeConfig = kubeconfig.KubeconfigRaw,
+            }, new CustomResourceOptions { DependsOn = { kubeconfig } });
+
+            var certManagerRelease = new Release("cert-manager", new ReleaseArgs
+            {
+                Name = "cert-manager",
+                Chart = "cert-manager",
+                Version = clusterOpts.CertManagerVersion,
+                Namespace = "cert-manager",
+                CreateNamespace = true,
+                RepositoryOpts = new RepositoryOptsArgs
+                {
+                    Repo = "https://charts.jetstack.io",
+                },
+                Values = new InputMap<object>
+                {
+                    ["crds"] = new Dictionary<string, object>
+                    {
+                        ["enabled"] = true,
+                    },
+                },
+            }, new CustomResourceOptions { Provider = k8sProvider, DependsOn = { k8sProvider } });
+
+            var argoCdRelease = new Release("argocd", new ReleaseArgs
+            {
+                Name = "argocd",
+                Chart = "argo-cd",
+                Version = clusterOpts.ArgoCdVersion,
+                Namespace = "argocd",
+                CreateNamespace = true,
+                RepositoryOpts = new RepositoryOptsArgs
+                {
+                    Repo = "https://argoproj.github.io/argo-helm",
+                },
+            }, new CustomResourceOptions { Provider = k8sProvider, DependsOn = { certManagerRelease } });
+
+            foreach (var app in applications)
+            {
+                var source = new Dictionary<string, object>
+                {
+                    ["repoURL"] = app.RepoUrl,
+                    ["targetRevision"] = app.TargetRevision,
+                };
+                if (!string.IsNullOrWhiteSpace(app.Path))
+                {
+                    source["path"] = app.Path;
+                }
+                if (!string.IsNullOrWhiteSpace(app.Chart))
+                {
+                    source["chart"] = app.Chart;
+                }
+
+                var syncPolicy = new Dictionary<string, object>();
+                if (app.AutomatedSync)
+                {
+                    syncPolicy["automated"] = new Dictionary<string, object>
+                    {
+                        ["prune"] = true,
+                        ["selfHeal"] = true,
+                    };
+                }
+                if (app.CreateNamespace)
+                {
+                    syncPolicy["syncOptions"] = new[] { "CreateNamespace=true" };
+                }
+
+                _ = new K8s.ApiExtensions.CustomResource($"argocd-app-{app.Name}", new ArgoCdApplicationResourceArgs
+                {
+                    Metadata = new ObjectMetaArgs
+                    {
+                        Name = app.Name,
+                        Namespace = app.Namespace,
+                        Finalizers = { "resources-finalizer.argocd.argoproj.io" },
+                    },
+                    Spec = new InputMap<object>
+                    {
+                        ["project"] = app.Project,
+                        ["source"] = source,
+                        ["destination"] = new Dictionary<string, object>
+                        {
+                            ["server"] = app.DestinationServer,
+                            ["namespace"] = app.DestinationNamespace,
+                        },
+                        ["syncPolicy"] = syncPolicy,
+                    },
+                }, new CustomResourceOptions { Provider = k8sProvider, DependsOn = { argoCdRelease } });
+            }
+
             return new Dictionary<string, object?>
             {
                 ["talosconfig"] = Output.CreateSecret(clientConfig.Apply(c => c.TalosConfig)),
-                ["kubeconfig"] = $"Run 'talosctl kubeconfig --nodes {firstMasterIp} --endpoints {firstMasterIp}' after bootstrap",
+                ["kubeconfig"] = Output.CreateSecret(kubeconfig.KubeconfigRaw),
             };
         }
 

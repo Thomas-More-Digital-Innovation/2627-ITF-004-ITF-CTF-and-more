@@ -18,6 +18,7 @@ namespace Infrastructure
             services.AddScoped<IEnvironmentService, EnvironmentService>();
 
             services.Configure<Infrastructure.Pulumi.ProxmoxOptions>(configuration.GetSection(Infrastructure.Pulumi.ProxmoxOptions.SectionName));
+            services.Configure<Infrastructure.Pulumi.CtfClusterOptions>(configuration.GetSection(Infrastructure.Pulumi.CtfClusterOptions.SectionName));
             services.Configure<OpnsenseOptions>(configuration.GetSection(OpnsenseOptions.SectionName));
             services.AddHttpClient<IOpnsenseService, OpnsenseService>((sp, client) =>
             {

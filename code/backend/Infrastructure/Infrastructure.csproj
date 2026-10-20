@@ -10,6 +10,7 @@
     <PackageReference Include="Microsoft.EntityFrameworkCore.InMemory" Version="10.0.12" />
     <PackageReference Include="Microsoft.Extensions.Http" Version="10.0.0" />
     <PackageReference Include="Pulumi.Automation" Version="3.114.1" />
+    <PackageReference Include="Pulumi.Kubernetes" Version="4.34.2" />
     <PackageReference Include="Pulumi.ProxmoxVE" Version="8.6.0" />
     <PackageReference Include="Pulumiverse.Talos" Version="0.8.1" />
   </ItemGroup>

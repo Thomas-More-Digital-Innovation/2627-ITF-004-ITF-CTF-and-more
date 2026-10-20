@@ -9,7 +9,11 @@ using System.Text.Json;
 
 namespace Infrastructure.Services
 {
-    public class EnvironmentService(AppDbContext dbContext, IOpnsenseService opnsense, IOptions<ProxmoxOptions> proxmoxOptions) : IEnvironmentService
+    public class EnvironmentService(
+        AppDbContext dbContext,
+        IOpnsenseService opnsense,
+        IOptions<ProxmoxOptions> proxmoxOptions,
+        IOptions<CtfClusterOptions> ctfClusterOptions) : IEnvironmentService
     {
         private readonly AppDbContext _dbContext = dbContext;
 
@@ -225,6 +229,7 @@ namespace Infrastructure.Services
             }
 
             var px = proxmoxOptions.Value;
+            var clusterOpts = ctfClusterOptions.Value;
             var vlanId = envRecord.VlanId;
 
             var envVars = new Dictionary<string, string?>
@@ -239,7 +244,7 @@ namespace Infrastructure.Services
             if (!string.IsNullOrWhiteSpace(px.Password)) envVars["PROXMOX_VE_PASSWORD"] = px.Password;
 
             // Inline C# Pulumi program (replaces terraform/environments/<env>)
-            var args = new InlineProgramArgs("cyberkit-environments", env, PulumiFn.Create(() => CtfEnvironmentProgram.Run(px, vlanId, envRecord.Cidr, env)))
+            var args = new InlineProgramArgs("cyberkit-environments", env, PulumiFn.Create(() => CtfEnvironmentProgram.Run(px, vlanId, envRecord.Cidr, env, clusterOptions: clusterOpts)))
             {
                 EnvironmentVariables = envVars
             };
