@@ -3,6 +3,8 @@ kind: Application
 metadata:
   name: ctfd
   namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
   finalizers:
     - resources-finalizer.argocd.argoproj.io
 spec:
@@ -16,12 +18,16 @@ spec:
         controller:
           replicas: 1
         service:
-          type: NodePort
+          type: ClusterIP
         ports:
           http:
             enabled: true
             port: 8000
-            nodePort: 30080
+        ingressRoute:
+          create: true
+          entryPoints:
+            - web
+          rule: Host(`ctf.local`) || PathPrefix(`/`)
         # Disabled until a StorageClass is provisioned on the Talos cluster
         persistentVolumeClaim:
           create: false
