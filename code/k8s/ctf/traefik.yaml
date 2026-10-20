@@ -17,12 +17,7 @@ spec:
       valuesObject:
         service:
           spec:
-            type: NodePort
-        ports:
-          web:
-            nodePort: 30080
-          websecure:
-            nodePort: 30443
+            type: LoadBalancer
         providers:
           kubernetesCRD:
             enabled: true
