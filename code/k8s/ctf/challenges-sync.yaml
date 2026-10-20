@@ -10,8 +10,6 @@ metadata:
   namespace: ctf
   annotations:
     argocd.argoproj.io/sync-wave: "2"
-    argocd.argoproj.io/hook: PostSync
-    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
     argocd.argoproj.io/sync-options: Replace=true
 spec:
   backoffLimit: 5
@@ -156,13 +154,23 @@ spec:
               work_dir = Path("/tmp/challenges")
               subprocess.run(["git", "clone", "--depth=1", authed_url, str(work_dir)], check=True)
 
-              # 4. Write .ctf/config and run ctfd-cli-autorun_all_teams.py for all static/standard challenges
-              ctf_dir = work_dir / ".ctf"
-              ctf_dir.mkdir(exist_ok=True)
-              (ctf_dir / "config").write_text(
-                  f"[config]\nurl = {ctfd_url}\naccess_token = {access_token}\n\n[challenges]\n"
-              )
-              subprocess.run([sys.executable, "ctfd-cli-autorun_all_teams.py"], cwd=work_dir, check=False)
+              # 4. Write .ctf/config and run ctfd-cli-autorun_all_teams.py if static challenges are not yet synced
+              existing_resp = requests.get(f"{ctfd_url}/api/v1/challenges?view=admin", headers=api_headers)
+              existing_resp.raise_for_status()
+              existing_list = existing_resp.json().get("data", [])
+
+              if len(existing_list) < 50:
+                  ctf_dir = work_dir / ".ctf"
+                  ctf_dir.mkdir(exist_ok=True)
+                  (ctf_dir / "config").write_text(
+                      f"[config]\nurl = {ctfd_url}\naccess_token = {access_token}\n\n[challenges]\n"
+                  )
+                  subprocess.run([sys.executable, "ctfd-cli-autorun_all_teams.py"], cwd=work_dir, check=False)
+                  existing_resp = requests.get(f"{ctfd_url}/api/v1/challenges?view=admin", headers=api_headers)
+                  existing_resp.raise_for_status()
+                  existing_list = existing_resp.json().get("data", [])
+              else:
+                  print(f"[*] {len(existing_list)} challenges already present in CTFd, skipping full ctfcli static re-sync.")
 
               # 5. Build containerized challenges locally into containerd (k8s.io, peered via Spegel)
               #    and convert them to dynamic_iac challenges in CTFd + chall-manager
@@ -186,9 +194,7 @@ spec:
                   ("Team A3/Web_Redirecting", "assets", "Dockerfile", 3000, "http", None),
               ]
 
-              existing_resp = requests.get(f"{ctfd_url}/api/v1/challenges?view=admin", headers=api_headers)
-              existing_resp.raise_for_status()
-              existing_by_name = {c["name"]: c for c in existing_resp.json().get("data", [])}
+              existing_by_name = {c["name"]: c for c in existing_list}
 
               for rel_path, ctx_subdir, dockerfile_name, port, proto, cmd_override in DYNAMIC_CHALLENGES:
                   chall_dir = work_dir / rel_path
