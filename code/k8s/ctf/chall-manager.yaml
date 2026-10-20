@@ -643,9 +643,11 @@ spec:
               cd /tmp/build
               go mod init k8s-monopod
               go get github.com/pulumi/pulumi/sdk/v3@v3.130.0
+              go mod tidy
               CGO_ENABLED=0 go build -o "${SCN_DIR}/main" main.go
               chmod +x "${SCN_DIR}/main"
-              CGO_ENABLED=0 go build -o /root/.cache/chall-manager/helper /scenario/helper.go
+              mkdir -p /tmp/helper && cp /scenario/helper.go /tmp/helper/helper.go
+              cd /tmp/helper && go mod init helper && CGO_ENABLED=0 go build -o /root/.cache/chall-manager/helper helper.go
               chmod +x /root/.cache/chall-manager/helper
           volumeMounts:
             - name: scenario-src
