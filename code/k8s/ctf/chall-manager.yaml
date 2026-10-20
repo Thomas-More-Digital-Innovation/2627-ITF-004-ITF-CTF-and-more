@@ -60,7 +60,10 @@ spec:
       serviceAccountName: chall-manager
       containers:
         - name: chall-manager
-          image: ctferio/chall-manager:v0.4.2
+          image: ctferio/chall-manager:v0.6.6
+          env:
+            - name: OCI_INSECURE
+              value: "true"
           ports:
             - name: http
               containerPort: 8080
@@ -74,6 +77,20 @@ spec:
             limits:
               cpu: 500m
               memory: 512Mi
+        - name: janitor
+          image: ctferio/chall-manager-janitor:v0.6.6
+          env:
+            - name: URL
+              value: localhost:8080
+            - name: TICKER
+              value: 1m
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
       volumes:
         - name: state
           emptyDir: {}
@@ -93,4 +110,3 @@ spec:
     - name: http
       port: 8080
       targetPort: 8080
-

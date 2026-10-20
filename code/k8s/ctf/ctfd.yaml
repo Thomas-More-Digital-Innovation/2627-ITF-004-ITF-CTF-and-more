@@ -15,6 +15,10 @@ spec:
     targetRevision: 2.0.0
     helm:
       valuesObject:
+        image:
+          registry: docker.io
+          repository: ctferio/ctfd
+          tag: "3.8.6-0.10.1"
         controller:
           replicas: 1
         service:
@@ -42,6 +46,8 @@ spec:
             value: /var/log/CTFd
           - name: REVERSE_PROXY
             value: "true"
+          - name: PLUGIN_SETTINGS_CM_API_URL
+            value: http://chall-manager.ctf.svc.cluster.local:8080
         extraVolumes:
           - name: ctfd-data
             emptyDir: {}
@@ -65,3 +71,4 @@ spec:
       selfHeal: true
     syncOptions:
       - CreateNamespace=true
+
