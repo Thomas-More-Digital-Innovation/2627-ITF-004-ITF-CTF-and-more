@@ -1,0 +1,117 @@
+# In-cluster Job that automatically initializes CTFd (if not yet set up),
+# clones the private GitLab challenges repo, and imports/syncs all challenges via ctfcli.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ctfd-challenges-sync
+  namespace: ctf
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 5
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: sync
+          image: python:3.11-slim
+          envFrom:
+            - secretRef:
+                name: gitlab-credentials
+                optional: true
+          env:
+            - name: CTFD_URL
+              value: "http://ctfd-web.ctf.svc.cluster.local:8000"
+          command:
+            - /bin/bash
+            - -ce
+            - |
+              apt-get update && apt-get install -y --no-install-recommends git curl && rm -rf /var/lib/apt/lists/*
+              pip install --no-cache-dir ctfcli requests pyyaml
+
+              echo "[*] Waiting for CTFd at ${CTFD_URL}..."
+              until curl -sf "${CTFD_URL}/healthcheck" > /dev/null; do
+                sleep 3
+              done
+
+              if [ -z "${GITLAB_TOKEN:-}" ]; then
+                echo "[!] GITLAB_TOKEN is not set in Secret 'gitlab-credentials'. Skipping private repo clone."
+                exit 0
+              fi
+
+              python3 - << 'PYEOF'
+              import os, re, subprocess, sys
+              from pathlib import Path
+              import requests
+
+              ctfd_url = os.environ["CTFD_URL"].rstrip("/")
+              admin_user = os.environ.get("CTFD_ADMIN_USER", "admin")
+              admin_email = os.environ.get("CTFD_ADMIN_EMAIL", "admin@ctf.local")
+              admin_password = os.environ.get("CTFD_ADMIN_PASSWORD", "admin")
+              repo_url = os.environ.get(
+                  "CHALLENGES_REPO_URL",
+                  "https://gitlab.com/it-factory-thomas-more/SKIL3/25-26/bsides-ctf/challenges.git",
+              )
+              gitlab_user = os.environ.get("GITLAB_USERNAME", "oauth2")
+              gitlab_token = os.environ["GITLAB_TOKEN"]
+
+              session = requests.Session()
+
+              # 1. Auto-complete CTFd /setup if not yet configured
+              r = session.get(f"{ctfd_url}/setup", allow_redirects=False)
+              if r.status_code == 200:
+                  print("[*] Performing initial CTFd setup...")
+                  nonce_match = re.search(r'name="nonce"[^>]*value="([^"]+)"', r.text)
+                  if not nonce_match:
+                      nonce_match = re.search(r"csrfNonce\s*:\s*['\"]([^'\"]+)['\"]", r.text)
+                  nonce = nonce_match.group(1)
+                  setup_data = {
+                      "ctf_name": "CyberKit CTF",
+                      "ctf_description": "CyberKit CTF Environment",
+                      "user_mode": "users",
+                      "name": admin_user,
+                      "email": admin_email,
+                      "password": admin_password,
+                      "ctf_theme": "core-beta",
+                      "nonce": nonce,
+                  }
+                  resp = session.post(f"{ctfd_url}/setup", data=setup_data)
+                  resp.raise_for_status()
+              else:
+                  print("[*] CTFd already initialized, logging in...")
+                  login_page = session.get(f"{ctfd_url}/login")
+                  nonce = re.search(r'name="nonce"[^>]*value="([^"]+)"', login_page.text).group(1)
+                  resp = session.post(
+                      f"{ctfd_url}/login",
+                      data={"name": admin_user, "password": admin_password, "nonce": nonce},
+                  )
+                  resp.raise_for_status()
+
+              # 2. Generate API token for ctfcli
+              settings_page = session.get(f"{ctfd_url}/settings")
+              csrf = re.search(r"csrfNonce\s*:\s*['\"]([^'\"]+)['\"]", settings_page.text).group(1)
+              tok_resp = session.post(
+                  f"{ctfd_url}/api/v1/tokens",
+                  headers={"CSRF-Token": csrf, "Content-Type": "application/json"},
+                  json={"expiration": "2099-01-01", "description": "in-cluster-ctfcli-sync"},
+              )
+              tok_resp.raise_for_status()
+              access_token = tok_resp.json()["data"]["value"]
+
+              # 3. Clone private GitLab challenges repo
+              authed_url = repo_url.replace("https://", f"https://{gitlab_user}:{gitlab_token}@")
+              work_dir = Path("/tmp/challenges")
+              subprocess.run(["git", "clone", "--depth=1", authed_url, str(work_dir)], check=True)
+
+              # 4. Write .ctf/config and run ctfd-cli-autorun_all_teams.py
+              ctf_dir = work_dir / ".ctf"
+              ctf_dir.mkdir(exist_ok=True)
+              (ctf_dir / "config").write_text(
+                  f"[config]\nurl = {ctfd_url}\naccess_token = {access_token}\n\n[challenges]\n"
+              )
+
+              subprocess.run([sys.executable, "ctfd-cli-autorun_all_teams.py"], cwd=work_dir, check=True)
+              PYEOF
+

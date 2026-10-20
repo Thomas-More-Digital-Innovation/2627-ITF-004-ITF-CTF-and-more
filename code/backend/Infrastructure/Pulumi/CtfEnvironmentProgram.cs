@@ -37,6 +37,12 @@ namespace Infrastructure.Pulumi
 
         public string CertManagerVersion { get; set; } = "v1.17.1";
         public string ArgoCdVersion { get; set; } = "7.8.2";
+        public string ChallengesRepoUrl { get; set; } = "https://gitlab.com/it-factory-thomas-more/SKIL3/25-26/bsides-ctf/challenges.git";
+        public string? GitlabUsername { get; set; }
+        public string? GitlabToken { get; set; }
+        public string CtfdAdminUser { get; set; } = "admin";
+        public string CtfdAdminEmail { get; set; } = "admin@ctf.local";
+        public string CtfdAdminPassword { get; set; } = "admin";
         public List<ArgoCdApplicationConfig> Applications { get; set; } = [];
 
         public static List<ArgoCdApplicationConfig> DefaultApplications =>
@@ -111,7 +117,14 @@ namespace Infrastructure.Pulumi
                   "disk": "/dev/sda",
                   "image": "factory.talos.dev/installer/{{TalosSchematicId}}:{{TalosVersion}}",
                   "wipe": true
-                }
+                },
+                "files": [
+                  {
+                    "path": "/etc/cri/conf.d/20-customization.part",
+                    "op": "create",
+                    "content": "[plugins.\"io.containerd.cri.v1.images\"]\n  discard_unpacked_layers = false\n"
+                  }
+                ]
               },
               "cluster": {
                 "network": {
@@ -258,6 +271,38 @@ namespace Infrastructure.Pulumi
                     Repo = "https://argoproj.github.io/argo-helm",
                 },
             }, new CustomResourceOptions { Provider = k8sProvider, DependsOn = { certManagerRelease } });
+
+            var ctfNamespace = new K8s.Core.V1.Namespace("ctf-namespace", new K8s.Types.Inputs.Core.V1.NamespaceArgs
+            {
+                Metadata = new ObjectMetaArgs
+                {
+                    Name = "ctf",
+                    Labels =
+                    {
+                        ["pod-security.kubernetes.io/enforce"] = "privileged",
+                        ["pod-security.kubernetes.io/audit"] = "privileged",
+                        ["pod-security.kubernetes.io/warn"] = "privileged",
+                    },
+                },
+            }, new CustomResourceOptions { Provider = k8sProvider, DependsOn = { k8sProvider } });
+
+            _ = new K8s.Core.V1.Secret("ctf-gitlab-credentials", new K8s.Types.Inputs.Core.V1.SecretArgs
+            {
+                Metadata = new ObjectMetaArgs
+                {
+                    Name = "gitlab-credentials",
+                    Namespace = "ctf",
+                },
+                StringData =
+                {
+                    ["CHALLENGES_REPO_URL"] = clusterOpts.ChallengesRepoUrl,
+                    ["GITLAB_USERNAME"] = clusterOpts.GitlabUsername ?? "oauth2",
+                    ["GITLAB_TOKEN"] = Output.CreateSecret(clusterOpts.GitlabToken ?? string.Empty),
+                    ["CTFD_ADMIN_USER"] = clusterOpts.CtfdAdminUser,
+                    ["CTFD_ADMIN_EMAIL"] = clusterOpts.CtfdAdminEmail,
+                    ["CTFD_ADMIN_PASSWORD"] = Output.CreateSecret(clusterOpts.CtfdAdminPassword),
+                },
+            }, new CustomResourceOptions { Provider = k8sProvider, DependsOn = { ctfNamespace } });
 
             foreach (var app in applications)
             {

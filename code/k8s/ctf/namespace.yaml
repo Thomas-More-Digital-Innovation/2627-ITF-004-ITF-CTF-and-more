@@ -20,3 +20,16 @@ metadata:
     pod-security.kubernetes.io/enforce: privileged
     pod-security.kubernetes.io/audit: privileged
     pod-security.kubernetes.io/warn: privileged
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: spegel
+  annotations:
+    argocd.argoproj.io/sync-wave: "-3"
+  labels:
+    kubernetes.io/metadata.name: spegel
+    # Required on Talos Linux so Spegel can access host containerd socket & content store
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: privileged

@@ -1,0 +1,33 @@
+# Stateless cluster-local P2P OCI registry mirror (Spegel)
+# Peers containerd image layers across all Talos nodes so any image/layer from
+# GitLab Registry, Docker Hub, GHCR, etc. is only pulled from upstream once.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: spegel
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: ghcr.io/spegel-org/helm-charts
+    chart: spegel
+    targetRevision: 0.8.0
+    helm:
+      valuesObject:
+        spegel:
+          # Talos Linux stores containerd registry mirror configs at /etc/cri/conf.d/hosts
+          containerdRegistryConfigPath: /etc/cri/conf.d/hosts
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: spegel
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+
