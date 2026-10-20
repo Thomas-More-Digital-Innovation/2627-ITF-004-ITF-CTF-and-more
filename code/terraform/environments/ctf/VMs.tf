@@ -32,8 +32,8 @@ resource "proxmox_download_file" "talos_iso" {
   content_type        = "iso"
   datastore_id        = "local"
   node_name           = var.vm_defaults.node_name
-  url                 = "https://factory.talos.dev/image/ce4c980550dd2ab1b17bbf2b08801c7eb59418eafe8f279833297925d67c7515/v1.7.6/metal-amd64.iso"
-  file_name           = "talos-v1.7.6-qemu-guest-agent.iso"
+  url                 = "https://factory.talos.dev/image/ce4c980550dd2ab1b17bbf2b08801c7eb59418eafe8f279833297925d67c7515/v1.14.4/nocloud-amd64.iso"
+  file_name           = "talos-v1.14.4-nocloud-qemu-guest-agent.iso"
   overwrite_unmanaged = true
 }
 

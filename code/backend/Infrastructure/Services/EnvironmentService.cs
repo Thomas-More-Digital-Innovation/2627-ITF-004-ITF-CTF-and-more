@@ -2,12 +2,14 @@ using Application.Interfaces;
 using Domain.Models;
 using Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
-using Pulumi.Automation;
+using Infrastructure.Pulumi;
+using Microsoft.Extensions.Options;
+using global::Pulumi.Automation;
 using System.Text.Json;
 
 namespace Infrastructure.Services
 {
-    public class EnvironmentService(AppDbContext dbContext) : IEnvironmentService
+    public class EnvironmentService(AppDbContext dbContext, IOpnsenseService opnsense, IOptions<ProxmoxOptions> proxmoxOptions) : IEnvironmentService
     {
         private readonly AppDbContext _dbContext = dbContext;
 
@@ -212,39 +214,53 @@ namespace Infrastructure.Services
             // Retrieve or allocate and store the environment with its VLAN ID and /16 CIDR
             var envRecord = await GetOrCreateEnvironmentAsync(environmentName);
 
-            // Ensure management stack (OPNsense VLAN interface & firewall rules) is applied FIRST
-            Console.WriteLine($"Applying central management/OPNsense network for {environmentName} (VLAN {envRecord.VlanId})...");
-            try
+            // Configure OPNsense (VLAN, interface assignment, firewall) through its API FIRST
+            Console.WriteLine($"Configuring OPNsense network for {environmentName} (VLAN {envRecord.VlanId})...");
+            await opnsense.ConfigureEnvironmentNetworkAsync(envRecord.VlanId, envRecord.Cidr, envRecord.Name);
+
+            var env = environmentName.Trim().ToLowerInvariant();
+            if (env != "ctf")
             {
-                await ApplyManagementAsync();
+                throw new NotSupportedException($"No Pulumi program is available for environment '{environmentName}'.");
             }
-            catch (Exception ex)
+
+            var px = proxmoxOptions.Value;
+            var vlanId = envRecord.VlanId;
+
+            var envVars = new Dictionary<string, string?>
             {
-                Console.WriteLine($"Management network apply notice: {ex.Message}");
-            }
+                { "PULUMI_BACKEND_URL", "file://~" },
+                { "PULUMI_CONFIG_PASSPHRASE", "default_passphrase" },
+                { "PROXMOX_VE_ENDPOINT", px.Endpoint },
+                { "PROXMOX_VE_INSECURE", px.Insecure ? "true" : "false" }
+            };
+            if (!string.IsNullOrWhiteSpace(px.ApiToken)) envVars["PROXMOX_VE_API_TOKEN"] = px.ApiToken;
+            if (!string.IsNullOrWhiteSpace(px.Username)) envVars["PROXMOX_VE_USERNAME"] = px.Username;
+            if (!string.IsNullOrWhiteSpace(px.Password)) envVars["PROXMOX_VE_PASSWORD"] = px.Password;
 
-            // Pass the dynamically assigned VLAN ID via terraform.tfvars.json in the environment directory
-            var envTfvarsJsonPath = Path.Combine(targetEnvPath, "terraform.tfvars.json");
-            var envTfvars = new { vlan_id = envRecord.VlanId };
-            await File.WriteAllTextAsync(envTfvarsJsonPath, JsonSerializer.Serialize(envTfvars, new JsonSerializerOptions { WriteIndented = true }));
-
-
-            var stackName = "dev";
-            var workspaceArgs = new LocalWorkspaceOptions
+            // Inline C# Pulumi program (replaces terraform/environments/<env>)
+            var args = new InlineProgramArgs("cyberkit-environments", env, PulumiFn.Create(() => CtfEnvironmentProgram.Run(px, vlanId, envRecord.Cidr, env)))
             {
-                WorkDir = targetEnvPath,
-                EnvironmentVariables = new Dictionary<string, string?>
-                {
-                    { "PULUMI_BACKEND_URL", "file://~" },
-                    { "PULUMI_CONFIG_PASSPHRASE", "default_passphrase" },
-                    { "PROXMOX_VE_INSECURE", "true" },
-                    { "TF_VAR_vlan_id", envRecord.VlanId.ToString() }
-                }
+                EnvironmentVariables = envVars
             };
 
-            var workspace = await LocalWorkspace.CreateAsync(workspaceArgs);
-            await workspace.InstallAsync();
-            var stack = await WorkspaceStack.CreateOrSelectAsync(stackName, workspace);
+            var stack = await LocalWorkspace.CreateOrSelectStackAsync(args);
+
+            // Explicitly set the provider config on the stack
+            await stack.SetConfigAsync("proxmoxve:endpoint", new ConfigValue(px.Endpoint));
+            await stack.SetConfigAsync("proxmoxve:insecure", new ConfigValue(px.Insecure ? "true" : "false"));
+            if (!string.IsNullOrWhiteSpace(px.ApiToken))
+            {
+                await stack.SetConfigAsync("proxmoxve:apiToken", new ConfigValue(px.ApiToken, isSecret: true));
+            }
+            if (!string.IsNullOrWhiteSpace(px.Username))
+            {
+                await stack.SetConfigAsync("proxmoxve:username", new ConfigValue(px.Username));
+            }
+            if (!string.IsNullOrWhiteSpace(px.Password))
+            {
+                await stack.SetConfigAsync("proxmoxve:password", new ConfigValue(px.Password, isSecret: true));
+            }
 
             try
             {
@@ -254,8 +270,6 @@ namespace Infrastructure.Services
             {
                 Console.WriteLine($"Pulumi cancel notice: {ex.Message}");
             }
-
-            await stack.RefreshAsync(new RefreshOptions { OnStandardOutput = Console.WriteLine });
 
             var result = await stack.UpAsync(new UpOptions { OnStandardOutput = Console.WriteLine });
 

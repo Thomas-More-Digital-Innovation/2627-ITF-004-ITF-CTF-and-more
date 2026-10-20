@@ -44,18 +44,6 @@ variable "cloud_image" {
   }
 }
 
-variable "opnsense" {
-  description = "OPNsense connection settings and parent interface configuration."
-  type = object({
-    uri              = string
-    api_key          = string
-    api_secret       = string
-    allow_insecure   = optional(bool, true)
-    parent_interface = optional(string, "vtnet0")
-  })
-  sensitive = true
-}
-
 variable "environments" {
   description = "Map of environments managed by .NET, specifying each environment's VLAN ID and /16 CIDR within 10.0.0.0/8"
   type = map(object({
