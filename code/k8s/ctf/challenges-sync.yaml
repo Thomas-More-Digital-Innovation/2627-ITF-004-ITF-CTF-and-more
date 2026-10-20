@@ -34,6 +34,8 @@ spec:
               mountPath: /run/containerd/containerd.sock
             - name: containerd-root
               mountPath: /var/lib/containerd
+            - name: buildkit-root
+              mountPath: /var/lib/buildkit
         - name: sync
           image: python:3.11-slim
           envFrom:
@@ -327,4 +329,8 @@ spec:
           hostPath:
             path: /var/lib/containerd
             type: Directory
+        - name: buildkit-root
+          hostPath:
+            path: /var/lib/buildkit
+            type: DirectoryOrCreate
 
