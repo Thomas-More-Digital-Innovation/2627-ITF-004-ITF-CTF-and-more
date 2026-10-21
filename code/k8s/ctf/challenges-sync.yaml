@@ -17,9 +17,10 @@ spec:
     spec:
       serviceAccountName: chall-manager
       restartPolicy: OnFailure
-      containers:
+      initContainers:
         - name: buildkitd
           image: moby/buildkit:v0.16.0
+          restartPolicy: Always
           args:
             - --addr
             - tcp://127.0.0.1:1234
@@ -27,6 +28,7 @@ spec:
             - --containerd-worker=false
           securityContext:
             privileged: true
+      containers:
         - name: sync
           image: python:3.11-slim
           envFrom:
@@ -39,7 +41,7 @@ spec:
             - name: BUILDKIT_HOST
               value: "tcp://127.0.0.1:1234"
             - name: CHALLENGE_HOST
-              value: "10.100.0.50"
+              value: "10.100.0.21"
           volumeMounts:
             - name: containerd-sock
               mountPath: /run/containerd/containerd.sock
@@ -49,11 +51,6 @@ spec:
             - /bin/bash
             - -ce
             - |
-              cleanup() {
-                kubectl exec -n ctf "$HOSTNAME" -c buildkitd -- kill 1 2>/dev/null || true
-              }
-              trap cleanup EXIT
-
               apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates tar && rm -rf /var/lib/apt/lists/*
               curl -fsSL "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl
               chmod +x /usr/local/bin/kubectl
@@ -201,24 +198,41 @@ spec:
 
                   meta = yaml.safe_load(chall_yml.read_text())
                   name = meta["name"]
+                  old = existing_by_name.get(name)
                   slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
                   image_ref = f"ctf.local/challenges/{slug}:latest"
                   build_ctx = chall_dir / ctx_subdir
 
+                  # Ensure flag.txt exists if the Dockerfile copies it (e.g. Web_Command_Injection)
+                  df_path = build_ctx / dockerfile_name
+                  if df_path.exists() and "flag.txt" in df_path.read_text(errors="ignore") and not (build_ctx / "flag.txt").exists():
+                      first_flag = meta.get("flags", [])
+                      if first_flag:
+                          fl_val = first_flag[0] if isinstance(first_flag[0], str) else first_flag[0].get("content", "")
+                          if fl_val:
+                              (build_ctx / "flag.txt").write_text(fl_val + "\n")
+
                   print(f"\n[*] Building {name} ({rel_path}) -> {image_ref} ...")
-                  build_cmd = [
-                      "nerdctl", "--namespace", "k8s.io", "build",
-                      "-t", image_ref,
-                      "-f", str(build_ctx / dockerfile_name),
-                      str(build_ctx),
-                  ]
-                  res = subprocess.run(build_cmd)
-                  if res.returncode != 0:
-                      print(f"[!] Build failed for {name}, keeping existing challenge entry.")
-                      continue
+                  img_check = subprocess.run(
+                      ["nerdctl", "--namespace", "k8s.io", "image", "inspect", image_ref],
+                      stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL,
+                  )
+                  if img_check.returncode == 0 or (old and old.get("type") == "dynamic_iac"):
+                      print(f"[*] Image {image_ref} already built in cluster, skipping build.")
+                  else:
+                      build_cmd = [
+                          "nerdctl", "--namespace", "k8s.io", "build",
+                          "-t", image_ref,
+                          "-f", str(df_path),
+                          str(build_ctx),
+                      ]
+                      res = subprocess.run(build_cmd)
+                      if res.returncode != 0:
+                          print(f"[!] Build failed for {name}, keeping existing challenge entry.")
+                          continue
 
                   # Remove old 'standard' challenge of the same name so we can replace with 'dynamic_iac'
-                  old = existing_by_name.get(name)
                   if old and old.get("type") != "dynamic_iac":
                       print(f"[*] Converting '{name}' (id={old['id']}) from {old.get('type')} to dynamic_iac...")
                       requests.delete(f"{ctfd_url}/api/v1/challenges/{old['id']}", headers=api_headers)
@@ -257,9 +271,11 @@ spec:
                   if old and old.get("type") == "dynamic_iac":
                       cid = old["id"]
                       r = requests.patch(f"{ctfd_url}/api/v1/challenges/{cid}", headers=api_headers, json=payload)
-                      r.raise_for_status()
-                      print(f"[+] Updated dynamic_iac challenge '{name}' (id={cid})")
-                      continue
+                      if r.ok:
+                          print(f"[+] Updated dynamic_iac challenge '{name}' (id={cid})")
+                          continue
+                      print(f"[*] Re-registering '{name}' (id={cid}) in chall-manager...")
+                      requests.delete(f"{ctfd_url}/api/v1/challenges/{cid}", headers=api_headers)
 
                   r = requests.post(f"{ctfd_url}/api/v1/challenges", headers=api_headers, json=payload)
                   if not r.ok:

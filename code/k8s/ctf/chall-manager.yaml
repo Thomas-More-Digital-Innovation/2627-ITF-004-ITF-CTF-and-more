@@ -133,289 +133,6 @@ data:
     			proto = "http"
     		}
 
-    		name := fmt.Sprintf("chall-%s", id)
-    		labels := map[string]string{
-    			"app.kubernetes.io/name":          name,
-    			"chall-manager.ctfer.io/identity": id,
-    		}
-
-    		dep := map[string]any{
-    			"apiVersion": "apps/v1",
-    			"kind":       "Deployment",
-    			"metadata": map[string]any{
-    				"name":      name,
-    				"namespace": "ctf",
-    				"labels":    labels,
-    			},
-    			"spec": map[string]any{
-    				"replicas": 1,
-    				"selector": map[string]any{"matchLabels": labels},
-    				"template": map[string]any{
-    					"metadata": map[string]any{"labels": labels},
-    					"spec": map[string]any{
-    						"containers": []map[string]any{
-    							{
-    								"name":            "chall",
-    								"image":           image,
-    								"imagePullPolicy": "IfNotPresent",
-    								"ports": []map[string]any{
-    									{"containerPort": port},
-    								},
-    							},
-    						},
-    					},
-    				},
-    			},
-    		}
-    		_, code, err := k8sRequest("POST", "/apis/apps/v1/namespaces/ctf/deployments", dep)
-    		if err != nil || (code >= 300 && code != 409) {
-    			return fmt.Errorf("create deployment failed (%d): %v", code, err)
-    		}
-
-    		svc := map[string]any{
-    			"apiVersion": "v1",
-    			"kind":       "Service",
-    			"metadata": map[string]any{
-    				"name":      name,
-    				"namespace": "ctf",
-    				"labels":    labels,
-    			},
-    			"spec": map[string]any{
-    				"type":     "NodePort",
-    				"selector": labels,
-    				"ports": []map[string]any{
-    					{"port": port, "targetPort": port, "protocol": "TCP"},
-    				},
-    			},
-    		}
-    		out, code, err := k8sRequest("POST", "/api/v1/namespaces/ctf/services", svc)
-    		if code == 409 {
-    			out, code, err = k8sRequest("GET", "/api/v1/namespaces/ctf/services/"+name, nil)
-    		}
-    		if err != nil || code >= 300 {
-    			return fmt.Errorf("create service failed (%d): %v", code, err)
-    		}
-
-    		var svcResp struct {
-    			Spec struct {
-    				Ports []struct {
-    					NodePort int `json:"nodePort"`
-    				} `json:"ports"`
-    			} `json:"spec"`
-    		}
-    		_ = json.Unmarshal(out, &svcResp)
-    		np := 0
-    		if len(svcResp.Spec.Ports) > 0 {
-    			np = svcResp.Spec.Ports[0].NodePort
-    		}
-
-    		conn := fmt.Sprintf("http://%s:%d", host, np)
-    		if proto == "ssh" {
-    			conn = fmt.Sprintf("ssh -p %d user@%s", np, host)
-    		} else if proto == "tcp" {
-    			conn = fmt.Sprintf("nc %s %d", host, np)
-    		}
-    		ctx.Export("connection_info", pulumi.String(conn))
-    		return nil
-    	})
-    }
-  helper.go: |
-    package main
-
-    import (
-    	"crypto/tls"
-    	"encoding/json"
-    	"fmt"
-    	"io"
-    	"net/http"
-    	"os"
-    	"path/filepath"
-    	"strings"
-    	"time"
-    )
-
-    const digest = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
-
-    func main() {
-    	go reaperLoop()
-    	http.HandleFunc("/v2/", func(w http.ResponseWriter, r *http.Request) {
-    		if r.URL.Path == "/v2/" {
-    			w.WriteHeader(http.StatusOK)
-    			return
-    		}
-    		w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
-    		w.Header().Set("Docker-Content-Digest", digest)
-    		body := []byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}`)
-    		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
-    		w.WriteHeader(http.StatusOK)
-    		if r.Method != http.MethodHead {
-    			_, _ = w.Write(body)
-    		}
-    	})
-    	_ = http.ListenAndServe("127.0.0.1:5000", nil)
-    }
-
-    func reaperLoop() {
-    	cli := &http.Client{
-    		Timeout: 10 * time.Second,
-    		Transport: &http.Transport{
-    			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-    		},
-    	}
-    	for {
-    		time.Sleep(10 * time.Second)
-    		active := map[string]bool{}
-    		_ = filepath.Walk("/tmp/chall-manager", func(path string, info os.FileInfo, err error) error {
-    			if err == nil && info != nil && info.Name() == "info.json" {
-    				b, err := os.ReadFile(path)
-    				if err == nil {
-    					var st struct {
-    						Identity string `json:"identity"`
-    					}
-    					if json.Unmarshal(b, &st) == nil && st.Identity != "" {
-    						active[st.Identity] = true
-    					}
-    				}
-    			}
-    			return nil
-    		})
-
-    		token, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
-    		if err != nil {
-    			continue
-    		}
-    		req, _ := http.NewRequest("GET", "https://kubernetes.default.svc/apis/apps/v1/namespaces/ctf/deployments?labelSelector=chall-manager.ctfer.io/identity", nil)
-    		req.Header.Set("Authorization", "Bearer "+string(token))
-    		resp, err := cli.Do(req)
-    		if err != nil {
-    			continue
-    		}
-    		body, _ := io.ReadAll(resp.Body)
-    		resp.Body.Close()
-
-    		var list struct {
-    			Items []struct {
-    				Metadata struct {
-    					Name   string            `json:"name"`
-    					Labels map[string]string `json:"labels"`
-    				} `json:"metadata"`
-    			} `json:"items"`
-    		}
-    		_ = json.Unmarshal(body, &list)
-    		for _, item := range list.Items {
-    			id := item.Metadata.Labels["chall-manager.ctfer.io/identity"]
-    			if id != "" && !active[id] && strings.HasPrefix(item.Metadata.Name, "chall-") {
-    				delDep, _ := http.NewRequest("DELETE", "https://kubernetes.default.svc/apis/apps/v1/namespaces/ctf/deployments/"+item.Metadata.Name, nil)
-    				delDep.Header.Set("Authorization", "Bearer "+string(token))
-    				if r, err := cli.Do(delDep); err == nil {
-    					r.Body.Close()
-    				}
-    				delSvc, _ := http.NewRequest("DELETE", "https://kubernetes.default.svc/api/v1/namespaces/ctf/services/"+item.Metadata.Name, nil)
-    				delSvc.Header.Set("Authorization", "Bearer "+string(token))
-    				if r, err := cli.Do(delSvc); err == nil {
-    					r.Body.Close()
-    				}
-    			}
-    		}
-    	}
-    }
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: chall-manager-scenario
-  namespace: ctf
-data:
-  Pulumi.yaml: |
-    name: k8s-monopod
-    runtime:
-      name: go
-      options:
-        binary: ./main
-  main.go: |
-    package main
-
-    import (
-    	"bytes"
-    	"crypto/tls"
-    	"encoding/json"
-    	"fmt"
-    	"io"
-    	"net/http"
-    	"os"
-    	"strconv"
-    	"time"
-
-    	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
-    	"github.com/pulumi/pulumi/sdk/v3/go/pulumi/config"
-    )
-
-    func k8sRequest(method, path string, body any) ([]byte, int, error) {
-    	token, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
-    	if err != nil {
-    		return nil, 0, err
-    	}
-    	var rdr io.Reader
-    	if body != nil {
-    		b, err := json.Marshal(body)
-    		if err != nil {
-    			return nil, 0, err
-    		}
-    		rdr = bytes.NewReader(b)
-    	}
-    	req, err := http.NewRequest(method, "https://kubernetes.default.svc"+path, rdr)
-    	if err != nil {
-    		return nil, 0, err
-    	}
-    	req.Header.Set("Authorization", "Bearer "+string(token))
-    	req.Header.Set("Content-Type", "application/json")
-    	cli := &http.Client{
-    		Timeout: 15 * time.Second,
-    		Transport: &http.Transport{
-    			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-    		},
-    	}
-    	resp, err := cli.Do(req)
-    	if err != nil {
-    		return nil, 0, err
-    	}
-    	defer resp.Body.Close()
-    	out, _ := io.ReadAll(resp.Body)
-    	return out, resp.StatusCode, nil
-    }
-
-    func main() {
-    	pulumi.Run(func(ctx *pulumi.Context) error {
-    		cfg := config.New(ctx, "k8s-monopod")
-    		id := cfg.Get("identity")
-    		addStr := cfg.Get("additional")
-    		add := map[string]string{}
-    		if addStr != "" {
-    			_ = json.Unmarshal([]byte(addStr), &add)
-    		}
-
-    		if ctx.DryRun() {
-    			ctx.Export("connection_info", pulumi.String("http://preview.ctf.local"))
-    			return nil
-    		}
-
-    		image := add["image"]
-    		if image == "" {
-    			image = "nginx:alpine"
-    		}
-    		port, err := strconv.Atoi(add["port"])
-    		if err != nil || port <= 0 {
-    			port = 80
-    		}
-    		host := add["host"]
-    		if host == "" {
-    			host = "10.100.0.50"
-    		}
-    		proto := add["protocol"]
-    		if proto == "" {
-    			proto = "http"
-    		}
-
     		container := map[string]any{
     			"name":            "chall",
     			"image":           image,
@@ -585,15 +302,16 @@ data:
     		var list struct {
     			Items []struct {
     				Metadata struct {
-    					Name   string            `json:"name"`
-    					Labels map[string]string `json:"labels"`
+    					Name              string            `json:"name"`
+    					CreationTimestamp time.Time         `json:"creationTimestamp"`
+    					Labels            map[string]string `json:"labels"`
     				} `json:"metadata"`
     			} `json:"items"`
     		}
     		_ = json.Unmarshal(body, &list)
     		for _, item := range list.Items {
     			id := item.Metadata.Labels["chall-manager.ctfer.io/identity"]
-    			if id != "" && !active[id] && strings.HasPrefix(item.Metadata.Name, "chall-") {
+    			if id != "" && !active[id] && strings.HasPrefix(item.Metadata.Name, "chall-") && time.Since(item.Metadata.CreationTimestamp) > 30*time.Second {
     				delDep, _ := http.NewRequest("DELETE", "https://kubernetes.default.svc/apis/apps/v1/namespaces/ctf/deployments/"+item.Metadata.Name, nil)
     				delDep.Header.Set("Authorization", "Bearer "+string(token))
     				if r, err := cli.Do(delDep); err == nil {
@@ -660,6 +378,12 @@ spec:
           env:
             - name: OCI_INSECURE
               value: "true"
+            - name: OTEL_TRACES_EXPORTER
+              value: "none"
+            - name: OTEL_METRICS_EXPORTER
+              value: "none"
+            - name: OTEL_LOGS_EXPORTER
+              value: "none"
           ports:
             - name: http
               containerPort: 8080
