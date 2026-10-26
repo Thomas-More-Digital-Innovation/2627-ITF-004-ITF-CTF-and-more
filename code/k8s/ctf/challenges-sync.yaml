@@ -12,7 +12,6 @@ metadata:
     argocd.argoproj.io/sync-wave: "2"
     argocd.argoproj.io/sync-options: Force=true,Replace=true
 spec:
-  ttlSecondsAfterFinished: 300
   backoffLimit: 5
   template:
     spec:
