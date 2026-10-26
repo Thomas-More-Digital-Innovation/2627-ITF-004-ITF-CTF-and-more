@@ -180,8 +180,7 @@ spec:
               else:
                   print(f"[*] {len(existing_list)} challenges already present in CTFd, skipping full ctfcli static re-sync.")
 
-              # 5. Build containerized challenges locally into containerd (k8s.io, peered via Spegel)
-              #    and convert them to dynamic_iac challenges in CTFd + chall-manager
+              # 5. Build containerized challenges in parallel by spawning a Pod per build across worker nodes
               DYNAMIC_CHALLENGES = [
                   ("Team A1/The-13th-Cabin", ".", "Dockerfile", 5000, "http", None),
                   ("Team A1/camp-forest-green-found-footage", "web", "Dockerfile", 5000, "http", None),
@@ -203,6 +202,8 @@ spec:
               ]
 
               existing_by_name = {c["name"]: c for c in existing_list}
+              to_build = []
+              chall_configs = []
 
               for rel_path, ctx_subdir, dockerfile_name, port, proto, cmd_override in DYNAMIC_CHALLENGES:
                   chall_dir = work_dir / rel_path
@@ -217,35 +218,188 @@ spec:
                   slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
                   image_ref = f"ctf.local/challenges/{slug}:latest"
                   build_ctx = chall_dir / ctx_subdir
-
-                  # Ensure flag.txt exists if the Dockerfile copies it (e.g. Web_Command_Injection)
                   df_path = build_ctx / dockerfile_name
-                  if df_path.exists() and "flag.txt" in df_path.read_text(errors="ignore") and not (build_ctx / "flag.txt").exists():
-                      first_flag = meta.get("flags", [])
-                      if first_flag:
-                          fl_val = first_flag[0] if isinstance(first_flag[0], str) else first_flag[0].get("content", "")
-                          if fl_val:
-                              (build_ctx / "flag.txt").write_text(fl_val + "\n")
 
-                  print(f"\n[*] Building {name} ({rel_path}) -> {image_ref} ...")
+                  fl_val = ""
+                  first_flag = meta.get("flags", [])
+                  if first_flag:
+                      fl_val = first_flag[0] if isinstance(first_flag[0], str) else first_flag[0].get("content", "")
+
+                  chall_info = {
+                      "rel_path": rel_path,
+                      "ctx_subdir": ctx_subdir,
+                      "dockerfile_name": dockerfile_name,
+                      "port": port,
+                      "proto": proto,
+                      "cmd_override": cmd_override,
+                      "meta": meta,
+                      "name": name,
+                      "old": old,
+                      "slug": slug,
+                      "image_ref": image_ref,
+                      "flag_val": fl_val,
+                  }
+                  chall_configs.append(chall_info)
+
                   img_check = subprocess.run(
                       ["nerdctl", "--namespace", "k8s.io", "image", "inspect", image_ref],
                       stdout=subprocess.DEVNULL,
                       stderr=subprocess.DEVNULL,
                   )
                   if img_check.returncode == 0 or (old and old.get("type") == "dynamic_iac"):
-                      print(f"[*] Image {image_ref} already built in cluster, skipping build.")
+                      print(f"[*] Image {image_ref} already available in cluster, skipping build.")
                   else:
-                      build_cmd = [
-                          "nerdctl", "--namespace", "k8s.io", "build",
-                          "-t", image_ref,
-                          "-f", str(df_path),
-                          str(build_ctx),
-                      ]
-                      res = subprocess.run(build_cmd)
-                      if res.returncode != 0:
-                          print(f"[!] Build failed for {name}, keeping existing challenge entry.")
-                          continue
+                      to_build.append(chall_info)
+
+              # Dispatch parallel builder pods across the worker nodes
+              if to_build:
+                  import time
+                  print(f"\n[*] Dispatching {len(to_build)} parallel builder pods across the cluster...")
+                  spawned_pods = []
+                  for c in to_build:
+                      pod_name = f"chall-build-{c['slug']}"
+                      spawned_pods.append((pod_name, c))
+                      pod_dict = {
+                          "apiVersion": "v1",
+                          "kind": "Pod",
+                          "metadata": {
+                              "name": pod_name,
+                              "namespace": "ctf",
+                              "labels": {
+                                  "app.kubernetes.io/name": "challenge-builder",
+                                  "ctf.local/challenge": c["slug"],
+                              },
+                          },
+                          "spec": {
+                              "restartPolicy": "Never",
+                              "initContainers": [
+                                  {
+                                      "name": "buildkitd",
+                                      "image": "moby/buildkit:v0.16.0",
+                                      "restartPolicy": "Always",
+                                      "args": [
+                                          "--addr",
+                                          "tcp://127.0.0.1:1234",
+                                          "--oci-worker=true",
+                                          "--containerd-worker=false",
+                                      ],
+                                      "securityContext": {"privileged": True},
+                                  }
+                              ],
+                              "containers": [
+                                  {
+                                      "name": "builder",
+                                      "image": "alpine:3.20",
+                                      "envFrom": [
+                                          {"secretRef": {"name": "gitlab-credentials", "optional": True}}
+                                      ],
+                                      "env": [
+                                          {"name": "BUILDKIT_HOST", "value": "tcp://127.0.0.1:1234"},
+                                          {"name": "CHALL_REPO_URL", "value": repo_url},
+                                          {"name": "CHALL_REL_PATH", "value": c["rel_path"]},
+                                          {"name": "CHALL_CTX_SUBDIR", "value": c["ctx_subdir"]},
+                                          {"name": "DOCKERFILE_NAME", "value": c["dockerfile_name"]},
+                                          {"name": "IMAGE_REF", "value": c["image_ref"]},
+                                          {"name": "FLAG_CONTENT", "value": c["flag_val"]},
+                                      ],
+                                      "volumeMounts": [
+                                          {"name": "containerd-sock", "mountPath": "/run/containerd/containerd.sock"},
+                                          {"name": "containerd-root", "mountPath": "/var/lib/containerd"},
+                                      ],
+                                      "command": [
+                                          "/bin/sh",
+                                          "-ce",
+                                          (
+                                              "apk add --no-cache git curl ca-certificates tar\n"
+                                              "curl -fsSL https://github.com/containerd/nerdctl/releases/download/v1.7.7/nerdctl-1.7.7-linux-amd64.tar.gz | tar -xz -C /usr/local/bin nerdctl\n"
+                                              "curl -fsSL https://github.com/moby/buildkit/releases/download/v0.16.0/buildkit-v0.16.0.linux-amd64.tar.gz | tar -xz -C /usr/local bin/buildctl\n"
+                                              "until buildctl debug workers > /dev/null 2>&1; do sleep 1; done\n"
+                                              "AUTH=\"\"\n"
+                                              "if [ -n \"$GITLAB_TOKEN\" ]; then AUTH=\"${GITLAB_USERNAME:-oauth2}:${GITLAB_TOKEN}@\"; fi\n"
+                                              "AUTHED_URL=\"$(echo \"$CHALL_REPO_URL\" | sed \"s|https://|https://${AUTH}|\")\"\n"
+                                              "echo \"[*] Sparse cloning ${CHALL_REL_PATH}...\"\n"
+                                              "git clone --depth 1 --filter=blob:none --sparse \"$AUTHED_URL\" /tmp/repo\n"
+                                              "cd /tmp/repo && git sparse-checkout set \"$CHALL_REL_PATH\"\n"
+                                              "BUILD_CTX=\"/tmp/repo/${CHALL_REL_PATH}/${CHALL_CTX_SUBDIR}\"\n"
+                                              "DF_PATH=\"${BUILD_CTX}/${DOCKERFILE_NAME}\"\n"
+                                              "if [ -n \"$FLAG_CONTENT\" ] && [ ! -f \"${BUILD_CTX}/flag.txt\" ]; then\n"
+                                              "  if grep -q \"flag.txt\" \"$DF_PATH\" 2>/dev/null; then echo \"$FLAG_CONTENT\" > \"${BUILD_CTX}/flag.txt\"; fi\n"
+                                              "fi\n"
+                                              "echo \"[*] Building ${IMAGE_REF} ...\"\n"
+                                              "nerdctl --namespace k8s.io build -t \"$IMAGE_REF\" -f \"$DF_PATH\" \"$BUILD_CTX\"\n"
+                                              "echo \"[+] Successfully built ${IMAGE_REF}\"\n"
+                                          ),
+                                      ],
+                                  }
+                              ],
+                              "volumes": [
+                                  {
+                                      "name": "containerd-sock",
+                                      "hostPath": {
+                                          "path": "/run/containerd/containerd.sock",
+                                          "type": "Socket",
+                                      },
+                                  },
+                                  {
+                                      "name": "containerd-root",
+                                      "hostPath": {
+                                          "path": "/var/lib/containerd",
+                                          "type": "Directory",
+                                      },
+                                  },
+                              ],
+                          },
+                      }
+                      pod_manifest = yaml.dump(pod_dict)
+                      subprocess.run(["kubectl", "apply", "-f", "-"], input=pod_manifest, text=True, check=True)
+
+                  start_time = time.time()
+                  print(f"[*] Waiting for {len(spawned_pods)} parallel builder pods to complete...")
+                  completed_pods = set()
+                  failed_pods = set()
+
+                  while len(completed_pods) + len(failed_pods) < len(spawned_pods):
+                      time.sleep(3)
+                      for pod_name, c in spawned_pods:
+                          if pod_name in completed_pods or pod_name in failed_pods:
+                              continue
+                          p_check = subprocess.run(
+                              ["kubectl", "get", "pod", "-n", "ctf", pod_name, "-o", "jsonpath={.status.phase}"],
+                              capture_output=True,
+                              text=True,
+                          )
+                          phase = p_check.stdout.strip()
+                          if phase == "Succeeded":
+                              completed_pods.add(pod_name)
+                              print(f"[+] [{len(completed_pods)}/{len(spawned_pods)}] Build succeeded for {c['name']} (pod: {pod_name})")
+                          elif phase == "Failed":
+                              failed_pods.add(pod_name)
+                              print(f"[!] Build FAILED for {c['name']} (pod: {pod_name})")
+                              err_logs = subprocess.run(
+                                  ["kubectl", "logs", "-n", "ctf", pod_name, "-c", "builder", "--tail=30"],
+                                  capture_output=True,
+                                  text=True,
+                              )
+                              print(f"--- Logs for {pod_name} ---\n{err_logs.stdout}\n---")
+                      if time.time() - start_time > 900:
+                          print("[!] Timeout after 15 minutes waiting for builder pods.")
+                          break
+
+                  print(f"[*] Parallel build finished in {int(time.time() - start_time)}s: {len(completed_pods)} succeeded, {len(failed_pods)} failed.")
+
+                  # Clean up builder pods
+                  subprocess.run(["kubectl", "delete", "pods", "-n", "ctf", "-l", "app.kubernetes.io/name=challenge-builder", "--ignore-not-found"], check=False)
+
+              # Register dynamic_iac challenges in CTFd
+              for c in chall_configs:
+                  name = c["name"]
+                  old = c["old"]
+                  image_ref = c["image_ref"]
+                  port = c["port"]
+                  proto = c["proto"]
+                  cmd_override = c["cmd_override"]
+                  meta = c["meta"]
+                  chall_dir = work_dir / c["rel_path"]
 
                   # Remove old 'standard' challenge of the same name so we can replace with 'dynamic_iac'
                   if old and old.get("type") != "dynamic_iac":
