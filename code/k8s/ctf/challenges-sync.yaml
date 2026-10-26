@@ -18,17 +18,6 @@ spec:
     spec:
       serviceAccountName: chall-manager
       restartPolicy: OnFailure
-      initContainers:
-        - name: buildkitd
-          image: moby/buildkit:v0.16.0
-          restartPolicy: Always
-          args:
-            - --addr
-            - tcp://127.0.0.1:1234
-            - --oci-worker=true
-            - --containerd-worker=false
-          securityContext:
-            privileged: true
       containers:
         - name: sync
           image: python:3.11-slim
@@ -39,17 +28,10 @@ spec:
           env:
             - name: CTFD_URL
               value: "http://ctfd-web.ctf.svc.cluster.local:8000"
-            - name: BUILDKIT_HOST
-              value: "tcp://127.0.0.1:1234"
             - name: CHALLENGE_HOST
               value: "10.100.0.21"
             - name: FORCE_REBUILD
-              value: "true"
-          volumeMounts:
-            - name: containerd-sock
-              mountPath: /run/containerd/containerd.sock
-            - name: containerd-root
-              mountPath: /var/lib/containerd
+              value: "false"
           command:
             - /bin/bash
             - -ce
@@ -58,19 +40,11 @@ spec:
               curl -fsSL "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl
               chmod +x /usr/local/bin/kubectl
 
-              curl -fsSL "https://github.com/moby/buildkit/releases/download/v0.16.0/buildkit-v0.16.0.linux-amd64.tar.gz" | tar -xz -C /usr/local bin/buildctl
-              curl -fsSL "https://github.com/containerd/nerdctl/releases/download/v1.7.7/nerdctl-1.7.7-linux-amd64.tar.gz" | tar -xz -C /usr/local/bin nerdctl
-
               pip install --no-cache-dir ctfcli requests pyyaml
 
               echo "[*] Waiting for CTFd at ${CTFD_URL}..."
               until curl -sf "${CTFD_URL}/healthcheck" > /dev/null; do
                 sleep 3
-              done
-
-              echo "[*] Waiting for local BuildKit containerd worker..."
-              until buildctl debug workers > /dev/null 2>&1; do
-                sleep 2
               done
 
               if [ -z "${GITLAB_TOKEN:-}" ]; then
@@ -244,13 +218,8 @@ spec:
                   }
                   chall_configs.append(chall_info)
 
-                  img_check = subprocess.run(
-                      ["nerdctl", "--namespace", "k8s.io", "image", "inspect", image_ref],
-                      stdout=subprocess.DEVNULL,
-                      stderr=subprocess.DEVNULL,
-                  )
-                  if not force_rebuild and (img_check.returncode == 0 or (old and old.get("type") == "dynamic_iac")):
-                      print(f"[*] Image {image_ref} already available in cluster, skipping build.")
+                  if not force_rebuild and (old and old.get("type") == "dynamic_iac"):
+                      print(f"[*] Challenge '{name}' already registered as dynamic_iac in CTFd, skipping build.")
                   else:
                       to_build.append(chall_info)
 
@@ -500,13 +469,4 @@ spec:
                                   data={"challenge_id": cid, "type": "challenge"},
                               )
               PYEOF
-      volumes:
-        - name: containerd-sock
-          hostPath:
-            path: /run/containerd/containerd.sock
-            type: Socket
-        - name: containerd-root
-          hostPath:
-            path: /var/lib/containerd
-            type: Directory
 
