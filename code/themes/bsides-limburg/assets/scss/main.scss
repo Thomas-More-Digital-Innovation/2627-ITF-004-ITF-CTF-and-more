@@ -1,0 +1,221 @@
+@use "bootstrap/scss/bootstrap" as * with (
+  $primary: #8B0000,
+  $secondary: #4a4a4a,
+  $success: #006400,
+  $info: #6B238E,
+  $warning: #FF6600,
+  $danger: #DC143C
+);
+
+@use "includes/components/table";
+@use "includes/components/jumbotron";
+@use "includes/components/challenge";
+@use "includes/components/sticky-footer";
+@use "includes/components/graphs";
+
+@use "includes/utils/fonts";
+@use "includes/utils/opacity";
+@use "includes/utils/min-height";
+@use "includes/utils/cursors";
+@use "includes/utils/lolight";
+
+@use "includes/icons/award-icons";
+@use "includes/icons/flag-icons";
+
+h1,
+h2 {
+  font-weight: 500;
+  letter-spacing: 2px;
+}
+
+a {
+  text-decoration: none !important;
+}
+
+blockquote {
+  border-left: 4px solid $primary;
+  padding-left: 15px;
+}
+
+input,
+select {
+  padding: 0.6rem !important;
+  height: auto !important;
+}
+
+.fa-spin.spinner {
+  text-align: center;
+  opacity: 0.5;
+}
+
+.badge-notification {
+  vertical-align: top;
+  margin-left: -1.5em;
+  font-size: 50%;
+}
+
+.form-select {
+  background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 4 5'%3e%3cpath fill='%23343a40' d='M2 0L0 2h4zm0 5L0 3h4z'/%3e%3c/svg%3e");
+  background-size: 8px 10px;
+}
+
+/* Dark mode theme customizations
+-------------------------------------------------- */
+[data-bs-theme="dark"] {
+  body,
+  & {
+    background: linear-gradient(180deg, #0d0d0d 0%, #1a0a1a 50%, #0d0d0d 100%);
+    background-attachment: fixed;
+    color: #e8e8e8;
+  }
+
+  h1,
+  h2 {
+    text-shadow: 0 0 10px rgba(139, 0, 0, 0.5);
+  }
+
+  .navbar {
+    background: linear-gradient(90deg, #0d0d0d 0%, #1a0a1a 50%, #0d0d0d 100%);
+    border-bottom: 2px solid #8B0000;
+    box-shadow: 0 4px 15px rgba(139, 0, 0, 0.3);
+  }
+
+  .navbar-brand {
+    text-shadow: 0 0 10px rgba(139, 0, 0, 0.7);
+  }
+
+  .nav-link {
+    transition: all 0.3s ease;
+
+    &:hover {
+      color: #DC143C;
+      text-shadow: 0 0 8px rgba(220, 20, 60, 0.5);
+    }
+  }
+
+  .card {
+    background-color: rgba(26, 10, 26, 0.9);
+    border: 1px solid #333;
+    box-shadow: 0 0 20px rgba(0, 0, 0, 0.5);
+
+    &:hover {
+      border-color: #8B0000;
+      box-shadow: 0 0 25px rgba(139, 0, 0, 0.3);
+    }
+  }
+
+  .card-header {
+    background-color: rgba(139, 0, 0, 0.2);
+    border-bottom: 1px solid #8B0000;
+  }
+
+  .btn-primary {
+    background-color: #8B0000;
+    border-color: #8B0000;
+
+    &:hover {
+      background-color: #DC143C;
+      border-color: #DC143C;
+      box-shadow: 0 0 15px rgba(220, 20, 60, 0.5);
+    }
+  }
+
+  .btn-outline-primary {
+    color: #DC143C;
+    border-color: #8B0000;
+
+    &:hover {
+      background-color: #8B0000;
+      color: #fff;
+    }
+  }
+
+  .table {
+    --bs-table-bg: transparent;
+    --bs-table-striped-bg: rgba(139, 0, 0, 0.1);
+    --bs-table-hover-bg: rgba(139, 0, 0, 0.2);
+    color: #e8e8e8;
+  }
+
+  .footer {
+    background: linear-gradient(90deg, #0d0d0d 0%, #1a0a1a 50%, #0d0d0d 100%);
+    border-top: 1px solid #8B0000;
+  }
+
+  .jumbotron {
+    background: linear-gradient(135deg, rgba(139, 0, 0, 0.2) 0%, rgba(26, 10, 26, 0.8) 100%);
+    border: 1px solid #8B0000;
+    box-shadow: 0 0 30px rgba(139, 0, 0, 0.2);
+  }
+
+  .form-control {
+    background-color: #1a1a1a;
+    border-color: #333;
+    color: #e8e8e8;
+
+    &:focus {
+      border-color: #8B0000;
+      box-shadow: 0 0 10px rgba(139, 0, 0, 0.3);
+    }
+  }
+
+  .modal-content {
+    background-color: #1a0a1a;
+    border: 1px solid #8B0000;
+    box-shadow: 0 0 30px rgba(139, 0, 0, 0.4);
+  }
+
+  .modal-header {
+    border-bottom-color: #8B0000;
+  }
+
+  .modal-footer {
+    border-top-color: #333;
+  }
+
+  .alert-info {
+    background-color: rgba(107, 35, 142, 0.2);
+    border-color: #6B238E;
+    color: #e8e8e8;
+  }
+
+  .alert-success {
+    background-color: rgba(0, 100, 0, 0.2);
+    border-color: #00FF41;
+    color: #00FF41;
+  }
+
+  .alert-danger {
+    background-color: rgba(139, 0, 0, 0.2);
+    border-color: #DC143C;
+    color: #DC143C;
+  }
+
+  .badge.bg-primary {
+    background-color: #8B0000;
+  }
+
+  .badge.bg-success {
+    background-color: #006400;
+  }
+
+  &::-webkit-scrollbar,
+  ::-webkit-scrollbar {
+    width: 10px;
+  }
+
+  &::-webkit-scrollbar-track,
+  ::-webkit-scrollbar-track {
+    background: #0d0d0d;
+  }
+
+  &::-webkit-scrollbar-thumb,
+  ::-webkit-scrollbar-thumb {
+    background: #8B0000;
+    border-radius: 5px;
+
+    &:hover {
+      background: #DC143C;
+    }
+  }
+}

@@ -54,23 +54,16 @@ spec:
             env:
               - name: HOME
                 value: /tmp
-            envFrom:
-              - secretRef:
-                  name: gitlab-credentials
-                  optional: true
             command:
               - /bin/sh
               - -c
               - |
                 set -e
-                AUTH=""
-                if [ -n "$GITLAB_TOKEN" ]; then
-                  USER="${GITLAB_USERNAME:-oauth2}"
-                  AUTH="${USER}:${GITLAB_TOKEN}@"
-                fi
-                echo "[*] Cloning theme repository..."
-                git clone --depth 1 -b A1/bsides-theme https://${AUTH}gitlab.com/it-factory-thomas-more/SKIL3/25-26/bsides-ctf/ctfd-forked.git /tmp/repo
-                cp -r /tmp/repo/CTFd/themes/bsides-limburg/. /theme/
+                echo "[*] Cloning theme from repository..."
+                git clone --depth 1 --filter=blob:none --sparse https://github.com/Thomas-More-Digital-Innovation/2627-ITF-004-ITF-CTF-and-more.git /tmp/repo
+                cd /tmp/repo
+                git sparse-checkout set code/themes/bsides-limburg
+                cp -r code/themes/bsides-limburg/. /theme/
                 echo "[*] Theme bsides-limburg installed successfully."
             volumeMounts:
               - name: ctfd-theme-bsides
