@@ -48,12 +48,42 @@ spec:
             value: "true"
           - name: PLUGIN_SETTINGS_CM_API_URL
             value: http://chall-manager.ctf.svc.cluster.local:8080
+        extraInitContainers:
+          theme-sync:
+            image: alpine/git:v2.45.2
+            securityContext:
+              runAsUser: 0
+            envFrom:
+              - secretRef:
+                  name: gitlab-credentials
+                  optional: true
+            command:
+              - /bin/sh
+              - -c
+              - |
+                set -e
+                AUTH=""
+                if [ -n "$GITLAB_TOKEN" ]; then
+                  USER="${GITLAB_USERNAME:-oauth2}"
+                  AUTH="${USER}:${GITLAB_TOKEN}@"
+                fi
+                echo "[*] Cloning theme repository..."
+                git clone --depth 1 -b A1/bsides-theme https://${AUTH}gitlab.com/it-factory-thomas-more/SKIL3/25-26/bsides-ctf/ctfd-forked.git /tmp/repo
+                cp -r /tmp/repo/CTFd/themes/bsides-limburg/. /theme/
+                chown -R 1001:1001 /theme
+                chmod -R 755 /theme
+                echo "[*] Theme bsides-limburg installed successfully."
+            volumeMounts:
+              - name: ctfd-theme-bsides
+                mountPath: /theme
         extraVolumes:
           - name: ctfd-data
             emptyDir: {}
           - name: ctfd-uploads
             emptyDir: {}
           - name: ctfd-logs
+            emptyDir: {}
+          - name: ctfd-theme-bsides
             emptyDir: {}
         extraVolumeMounts:
           - name: ctfd-data
@@ -62,6 +92,8 @@ spec:
             mountPath: /var/uploads
           - name: ctfd-logs
             mountPath: /var/log/CTFd
+          - name: ctfd-theme-bsides
+            mountPath: /opt/CTFd/CTFd/themes/bsides-limburg
   destination:
     server: https://kubernetes.default.svc
     namespace: ctf

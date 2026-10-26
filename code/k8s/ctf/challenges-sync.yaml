@@ -110,7 +110,7 @@ spec:
                       "name": admin_user,
                       "email": admin_email,
                       "password": admin_password,
-                      "ctf_theme": "core-beta",
+                      "ctf_theme": "bsides-limburg",
                       "nonce": nonce,
                   }
                   resp = session.post(f"{ctfd_url}/setup", data=setup_data)
@@ -141,6 +141,20 @@ spec:
                   "Authorization": f"Token {access_token}",
                   "Content-Type": "application/json",
               }
+
+              # Ensure bsides-limburg theme is active
+              try:
+                  theme_patch = requests.patch(
+                      f"{ctfd_url}/api/v1/configs",
+                      headers=api_headers,
+                      json={"ctf_theme": "bsides-limburg"},
+                  )
+                  if theme_patch.ok:
+                      print("[*] Active CTFd theme set to bsides-limburg.")
+                  else:
+                      print(f"[!] Warning: Failed to set theme ({theme_patch.status_code}): {theme_patch.text}")
+              except Exception as e:
+                  print(f"[!] Warning: Exception updating theme: {e}")
 
               # 3. Clone private GitLab challenges repo
               authed_url = repo_url.replace("https://", f"https://{gitlab_user}:{gitlab_token}@")
