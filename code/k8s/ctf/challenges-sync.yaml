@@ -15,7 +15,7 @@ spec:
   backoffLimit: 5
   template:
     spec:
-      serviceAccountName: chall-manager
+      serviceAccountName: ctf-sync
       restartPolicy: OnFailure
       containers:
         - name: sync
@@ -235,7 +235,7 @@ spec:
                           "kind": "Pod",
                           "metadata": {
                               "name": pod_name,
-                              "namespace": "ctf",
+                              "namespace": "ctf-build",
                               "labels": {
                                   "app.kubernetes.io/name": "challenge-builder",
                                   "ctf.local/challenge": c["slug"],
@@ -243,6 +243,8 @@ spec:
                           },
                           "spec": {
                               "restartPolicy": "Never",
+                              "automountServiceAccountToken": False,
+                              "enableServiceLinks": False,
                               "initContainers": [
                                   {
                                       "name": "buildkitd",
@@ -335,7 +337,7 @@ spec:
                           if pod_name in completed_pods or pod_name in failed_pods:
                               continue
                           p_check = subprocess.run(
-                              ["kubectl", "get", "pod", "-n", "ctf", pod_name, "-o", "jsonpath={.status.phase}"],
+                              ["kubectl", "get", "pod", "-n", "ctf-build", pod_name, "-o", "jsonpath={.status.phase}"],
                               capture_output=True,
                               text=True,
                           )
@@ -347,7 +349,7 @@ spec:
                               failed_pods.add(pod_name)
                               print(f"[!] Build FAILED for {c['name']} (pod: {pod_name})")
                               err_logs = subprocess.run(
-                                  ["kubectl", "logs", "-n", "ctf", pod_name, "-c", "builder", "--tail=30"],
+                                  ["kubectl", "logs", "-n", "ctf-build", pod_name, "-c", "builder", "--tail=30"],
                                   capture_output=True,
                                   text=True,
                               )
@@ -359,7 +361,7 @@ spec:
                   print(f"[*] Parallel build finished in {int(time.time() - start_time)}s: {len(completed_pods)} succeeded, {len(failed_pods)} failed.")
 
                   # Clean up builder pods
-                  subprocess.run(["kubectl", "delete", "pods", "-n", "ctf", "-l", "app.kubernetes.io/name=challenge-builder", "--ignore-not-found"], check=False)
+                  subprocess.run(["kubectl", "delete", "pods", "-n", "ctf-build", "-l", "app.kubernetes.io/name=challenge-builder", "--ignore-not-found"], check=False)
 
               # Register dynamic_iac challenges in CTFd
               for c in chall_configs:

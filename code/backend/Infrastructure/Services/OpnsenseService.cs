@@ -30,6 +30,46 @@ namespace Infrastructure.Services
             await EnsureInternetRuleAsync(identifier, cidr, descr, vlanId, ct);
         }
 
+        public async Task RemoveEnvironmentNetworkAsync(int vlanId, string environmentName, CancellationToken ct = default)
+        {
+            var descr = $"{Prefix}{environmentName}";
+
+            // 1. Firewall rule (references the interface, so it goes first)
+            var rules = await SearchAsync("firewall/filter/searchRule", ct);
+            var rule = rules.FirstOrDefault(r => (string?)r["description"] == $"{descr} internet access");
+            if ((string?)rule?["uuid"] is { Length: > 0 } ruleUuid)
+            {
+                await PostAsync($"firewall/filter/delRule/{ruleUuid}", new { }, ct);
+                await PostAsync("firewall/filter/apply", new { }, ct);
+                Console.WriteLine($"Removed firewall rule for {descr}.");
+            }
+
+            // 2. Interface assignment (must be unlocked before it can be deleted)
+            var vlans = await SearchAsync("interfaces/vlan_settings/searchItem", ct);
+            var vlan = vlans.FirstOrDefault(r => (string?)r["tag"] == vlanId.ToString() && (string?)r["if"] == ParentInterface)
+                ?? vlans.FirstOrDefault(r => (string?)r["descr"] == descr);
+            var device = vlan is not null ? VlanDevice(vlan, vlanId) : null;
+
+            var assignments = await SearchAsync("interfaces/assignment/searchItem", ct);
+            var assignment = assignments.FirstOrDefault(r => (string?)r["descr"] == descr)
+                ?? (device is not null ? assignments.FirstOrDefault(r => (string?)r["if"] == device) : null);
+            if (((string?)assignment?["identifier"] ?? (string?)assignment?["uuid"]) is { Length: > 0 } id)
+            {
+                await PostAsync($"interfaces/assignment/setItem/{id}", new { @interface = new { @lock = "0" } }, ct);
+                await PostAsync($"interfaces/assignment/delItem/{id}", new { }, ct);
+                await PostAsync("interfaces/assignment/reconfigure", new { }, ct);
+                Console.WriteLine($"Removed interface assignment '{id}' for {descr}.");
+            }
+
+            // 3. VLAN device
+            if ((string?)vlan?["uuid"] is { Length: > 0 } vlanUuid)
+            {
+                await PostAsync($"interfaces/vlan_settings/delItem/{vlanUuid}", new { }, ct);
+                await PostAsync("interfaces/vlan_settings/reconfigure", new { }, ct);
+                Console.WriteLine($"Removed VLAN {vlanId} for {descr}.");
+            }
+        }
+
         private async Task<string> EnsureVlanAsync(int vlanId, string descr, CancellationToken ct)
         {
             var rows = await SearchAsync("interfaces/vlan_settings/searchItem", ct);

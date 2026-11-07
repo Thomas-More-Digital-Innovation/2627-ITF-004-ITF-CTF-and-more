@@ -1,12 +1,42 @@
+# Trusted platform workloads: CTFd, chall-manager, sync Job.
 apiVersion: v1
 kind: Namespace
 metadata:
   name: ctf
   labels:
     kubernetes.io/metadata.name: ctf
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/audit: baseline
+    pod-security.kubernetes.io/warn: baseline
+---
+# Short-lived challenge builder pods only. Privileged because they build straight into the
+# node's containerd (k8s.io namespace) so Spegel can peer the images without a registry.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ctf-build
+  annotations:
+    argocd.argoproj.io/sync-wave: "-3"
+  labels:
+    kubernetes.io/metadata.name: ctf-build
     pod-security.kubernetes.io/enforce: privileged
     pod-security.kubernetes.io/audit: privileged
     pod-security.kubernetes.io/warn: privileged
+---
+# Untrusted, player-facing challenge instances (created by chall-manager).
+# baseline blocks privileged/hostPath/hostNetwork/hostPort/added caps; restricted is only
+# audited because sshd/su/priv-esc challenges legitimately need root inside the container.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ctf-challenges
+  annotations:
+    argocd.argoproj.io/sync-wave: "-3"
+  labels:
+    kubernetes.io/metadata.name: ctf-challenges
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: baseline
 ---
 apiVersion: v1
 kind: Namespace

@@ -23,12 +23,6 @@ namespace Infrastructure.Services
             return basePath;
         }
 
-        private string GetEnvironmentsBasePath()
-        {
-            var basePath = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "..", "..", "terraform", "environments"));
-            return basePath;
-        }
-
         public async Task<CyberEnvironment> GetOrCreateEnvironmentAsync(string environmentName)
         {
             var normalizedName = environmentName.Trim().ToLowerInvariant();
@@ -209,10 +203,10 @@ namespace Infrastructure.Services
 
         public async Task<string> ApplyEnvironmentAsync(string environmentName)
         {
-            var targetEnvPath = Path.Combine(GetEnvironmentsBasePath(), environmentName);
-            if (!Directory.Exists(targetEnvPath))
+            var env = environmentName.Trim().ToLowerInvariant();
+            if (env != "ctf")
             {
-                throw new DirectoryNotFoundException($"Environment directory not found: {targetEnvPath}");
+                throw new NotSupportedException($"No Pulumi program is available for environment '{environmentName}'.");
             }
 
             // Retrieve or allocate and store the environment with its VLAN ID and /16 CIDR
@@ -222,12 +216,26 @@ namespace Infrastructure.Services
             Console.WriteLine($"Configuring OPNsense network for {environmentName} (VLAN {envRecord.VlanId})...");
             await opnsense.ConfigureEnvironmentNetworkAsync(envRecord.VlanId, envRecord.Cidr, envRecord.Name);
 
-            var env = environmentName.Trim().ToLowerInvariant();
-            if (env != "ctf")
+            var stack = await SelectEnvironmentStackAsync(env, envRecord);
+
+            try
             {
-                throw new NotSupportedException($"No Pulumi program is available for environment '{environmentName}'.");
+                await stack.CancelAsync();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Pulumi cancel notice: {ex.Message}");
             }
 
+            var result = await stack.UpAsync(new UpOptions { OnStandardOutput = Console.WriteLine });
+
+            return result.StandardOutput;
+        }
+
+        private const string EnvironmentsProjectName = "cyberkit-environments";
+
+        private async Task<WorkspaceStack> SelectEnvironmentStackAsync(string env, CyberEnvironment envRecord)
+        {
             var px = proxmoxOptions.Value;
             var clusterOpts = ctfClusterOptions.Value;
             var vlanId = envRecord.VlanId;
@@ -243,8 +251,8 @@ namespace Infrastructure.Services
             if (!string.IsNullOrWhiteSpace(px.Username)) envVars["PROXMOX_VE_USERNAME"] = px.Username;
             if (!string.IsNullOrWhiteSpace(px.Password)) envVars["PROXMOX_VE_PASSWORD"] = px.Password;
 
-            // Inline C# Pulumi program (replaces terraform/environments/<env>)
-            var args = new InlineProgramArgs("cyberkit-environments", env, PulumiFn.Create(() => CtfEnvironmentProgram.Run(px, vlanId, envRecord.Cidr, env, clusterOptions: clusterOpts)))
+            // Inline C# Pulumi program
+            var args = new InlineProgramArgs(EnvironmentsProjectName, env, PulumiFn.Create(() => CtfEnvironmentProgram.Run(px, vlanId, envRecord.Cidr, env, clusterOptions: clusterOpts)))
             {
                 EnvironmentVariables = envVars
             };
@@ -267,18 +275,71 @@ namespace Infrastructure.Services
                 await stack.SetConfigAsync("proxmoxve:password", new ConfigValue(px.Password, isSecret: true));
             }
 
-            try
+            return stack;
+        }
+
+        public async Task<string> DestroyEnvironmentAsync(string environmentName)
+        {
+            var env = environmentName.Trim().ToLowerInvariant();
+            var envRecord = await _dbContext.Environments.FirstOrDefaultAsync(e => e.Name.ToLower() == env);
+            if (envRecord is null)
             {
-                await stack.CancelAsync();
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Pulumi cancel notice: {ex.Message}");
+                await SeedFromManagementTfvarsAsync();
+                envRecord = await _dbContext.Environments.FirstOrDefaultAsync(e => e.Name.ToLower() == env)
+                    ?? throw new KeyNotFoundException($"Environment '{environmentName}' does not exist.");
             }
 
-            var result = await stack.UpAsync(new UpOptions { OnStandardOutput = Console.WriteLine });
+            var output = string.Empty;
+            if (env == "ctf")
+            {
+                var stack = await SelectEnvironmentStackAsync(env, envRecord);
+                try
+                {
+                    await stack.CancelAsync();
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Pulumi cancel notice: {ex.Message}");
+                }
 
-            return result.StandardOutput;
+                // Everything inside the cluster (Cilium, ArgoCD, namespaces, secrets, ...) dies with the VMs.
+                // Deleting it through the Kubernetes API first is slow, can hang on ArgoCD/namespace
+                // finalizers and fails outright when the cluster is already broken, so it is only
+                // dropped from the Pulumi state. The state is topologically ordered, so walking it in
+                // reverse removes dependents before the resources (and provider) they depend on.
+                var deployment = await stack.ExportStackAsync();
+                if (deployment.Json.TryGetProperty("deployment", out var dep) &&
+                    dep.TryGetProperty("resources", out var resources))
+                {
+                    var k8sUrns = resources.EnumerateArray()
+                        .Select(r => (Urn: r.GetProperty("urn").GetString(), Type: r.GetProperty("type").GetString()))
+                        .Where(r => r.Urn is not null && r.Type is not null &&
+                                    (r.Type.StartsWith("kubernetes:") || r.Type == "pulumi:providers:kubernetes"))
+                        .Select(r => r.Urn!)
+                        .Reverse()
+                        .ToList();
+
+                    foreach (var urn in k8sUrns)
+                    {
+                        await stack.State.DeleteAsync(urn, force: true);
+                    }
+                    Console.WriteLine($"Dropped {k8sUrns.Count} in-cluster resources from state for {env}.");
+                }
+
+                // Talos resources are no-ops on delete; this removes the VMs (and the ISO download).
+                var result = await stack.DestroyAsync(new DestroyOptions { OnStandardOutput = Console.WriteLine });
+                output = result.StandardOutput;
+                await stack.Workspace.RemoveStackAsync(env);
+            }
+
+            Console.WriteLine($"Removing OPNsense network for {envRecord.Name} (VLAN {envRecord.VlanId})...");
+            await opnsense.RemoveEnvironmentNetworkAsync(envRecord.VlanId, envRecord.Name);
+
+            _dbContext.Environments.Remove(envRecord);
+            await _dbContext.SaveChangesAsync();
+            await SyncManagementTerraformAsync();
+
+            return output;
         }
     }
 }

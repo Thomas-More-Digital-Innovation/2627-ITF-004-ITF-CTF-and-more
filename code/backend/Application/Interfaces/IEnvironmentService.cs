@@ -10,6 +10,7 @@ namespace Application.Interfaces
         Task<List<CyberEnvironment>> GetAllEnvironmentsAsync();
         Task<string> ApplyManagementAsync();
         Task<string> ApplyEnvironmentAsync(string environmentName);
+        Task<string> DestroyEnvironmentAsync(string environmentName);
         Task SyncManagementTerraformAsync();
     }
 }

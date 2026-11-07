@@ -1,0 +1,66 @@
+# Isolation for untrusted challenge instances in ctf-challenges.
+#
+# Enforced by Cilium (installed by the backend's Pulumi program; Talos runs with cni=none).
+# Cilium never matches in-cluster endpoints (pods, nodes, kube-apiserver) with ipBlock rules,
+# so the "public internet" rule below cannot be used to reach anything inside the cluster.
+#
+# Ingress: challenges are exposed through NodePort Services (ssh, nc, http, ...), and with
+# externalTrafficPolicy=Cluster the source can be any client IP or a SNATed node/CNI address,
+# so ingress cannot be pinned to Traefik or a fixed range. Ingress is therefore left open;
+# lateral movement (challenge -> challenge, challenge -> platform) is stopped on EGRESS instead,
+# which every challenge pod is subject to.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: ctf-challenges
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-player-ingress
+  namespace: ctf-challenges
+spec:
+  podSelector:
+    matchExpressions:
+      - key: chall-manager.ctfer.io/identity
+        operator: Exists
+  policyTypes: ["Ingress"]
+  ingress:
+    - {} # any source, any port the container listens on (NodePort traffic)
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: restrict-egress
+  namespace: ctf-challenges
+spec:
+  podSelector: {}
+  policyTypes: ["Egress"]
+  egress:
+    # Cluster DNS
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # Public internet only. Blocks pods (172.16/16), services incl. the API server (172.17/16),
+    # node/Talos/Kubernetes APIs, Proxmox, OPNsense and every environment VLAN (10/8),
+    # plus link-local metadata and CGNAT ranges.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10

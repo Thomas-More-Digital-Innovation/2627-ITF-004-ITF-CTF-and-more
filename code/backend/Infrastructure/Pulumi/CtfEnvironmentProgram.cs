@@ -35,6 +35,7 @@ namespace Infrastructure.Pulumi
     {
         public const string SectionName = "CtfCluster";
 
+        public string CiliumVersion { get; set; } = "1.20.4";
         public string CertManagerVersion { get; set; } = "v1.17.1";
         public string ArgoCdVersion { get; set; } = "7.8.2";
         public string ChallengesRepoUrl { get; set; } = "https://gitlab.com/it-factory-thomas-more/SKIL3/25-26/bsides-ctf/challenges.git";
@@ -79,7 +80,7 @@ namespace Infrastructure.Pulumi
     }
 
     /// <summary>
-    /// C# Pulumi port of terraform/environments/ctf (Talos Kubernetes cluster on Proxmox).
+    /// C# Pulumi program for the CTF environment (Talos Kubernetes cluster on Proxmox).
     /// </summary>
     public static class CtfEnvironmentProgram
     {
@@ -128,6 +129,7 @@ namespace Infrastructure.Pulumi
               },
               "cluster": {
                 "network": {
+                  "cni": { "name": "none" },
                   "podSubnets": ["172.16.0.0/16"],
                   "serviceSubnets": ["172.17.0.0/16"]
                 }
@@ -241,6 +243,40 @@ namespace Infrastructure.Pulumi
                 UpsertExistingObjects = true,
             }, new CustomResourceOptions { DependsOn = { kubeconfig } });
 
+            // CNI: Talos is configured with cni=none, so nodes stay NotReady until Cilium is up.
+            // Cilium enforces the NetworkPolicies in code/k8s/ctf (Flannel silently ignores them).
+            // Values follow the Talos guide: kube-proxy stays, cgroup2 is already mounted by Talos,
+            // and the agent gets explicit capabilities instead of SYS_MODULE (Talos forbids module loading).
+            var ciliumRelease = new Release("cilium", new ReleaseArgs
+            {
+                Name = "cilium",
+                Chart = "cilium",
+                Version = clusterOpts.CiliumVersion,
+                Namespace = "kube-system",
+                RepositoryOpts = new RepositoryOptsArgs
+                {
+                    Repo = "https://helm.cilium.io/",
+                },
+                Values = new InputMap<object>
+                {
+                    ["ipam"] = new Dictionary<string, object> { ["mode"] = "kubernetes" },
+                    ["kubeProxyReplacement"] = false,
+                    ["cgroup"] = new Dictionary<string, object>
+                    {
+                        ["autoMount"] = new Dictionary<string, object> { ["enabled"] = false },
+                        ["hostRoot"] = "/sys/fs/cgroup",
+                    },
+                    ["securityContext"] = new Dictionary<string, object>
+                    {
+                        ["capabilities"] = new Dictionary<string, object>
+                        {
+                            ["ciliumAgent"] = new[] { "CHOWN", "KILL", "NET_ADMIN", "NET_RAW", "IPC_LOCK", "SYS_ADMIN", "SYS_RESOURCE", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID" },
+                            ["cleanCiliumState"] = new[] { "NET_ADMIN", "SYS_ADMIN", "SYS_RESOURCE" },
+                        },
+                    },
+                },
+            }, new CustomResourceOptions { Provider = k8sProvider, DependsOn = { k8sProvider } });
+
             var certManagerRelease = new Release("cert-manager", new ReleaseArgs
             {
                 Name = "cert-manager",
@@ -259,7 +295,7 @@ namespace Infrastructure.Pulumi
                         ["enabled"] = true,
                     },
                 },
-            }, new CustomResourceOptions { Provider = k8sProvider, DependsOn = { k8sProvider } });
+            }, new CustomResourceOptions { Provider = k8sProvider, DependsOn = { ciliumRelease } });
 
             var argoCdRelease = new Release("argocd", new ReleaseArgs
             {
@@ -281,12 +317,42 @@ namespace Infrastructure.Pulumi
                     Name = "ctf",
                     Labels =
                     {
+                        ["pod-security.kubernetes.io/enforce"] = "baseline",
+                        ["pod-security.kubernetes.io/audit"] = "baseline",
+                        ["pod-security.kubernetes.io/warn"] = "baseline",
+                    },
+                },
+            }, new CustomResourceOptions { Provider = k8sProvider, DependsOn = { ciliumRelease } });
+
+            // Builder pods run privileged against the node's containerd, so they get their own
+            // namespace and only the GitLab credentials they need (no CTFd admin credentials).
+            var ctfBuildNamespace = new K8s.Core.V1.Namespace("ctf-build-namespace", new K8s.Types.Inputs.Core.V1.NamespaceArgs
+            {
+                Metadata = new ObjectMetaArgs
+                {
+                    Name = "ctf-build",
+                    Labels =
+                    {
                         ["pod-security.kubernetes.io/enforce"] = "privileged",
                         ["pod-security.kubernetes.io/audit"] = "privileged",
                         ["pod-security.kubernetes.io/warn"] = "privileged",
                     },
                 },
-            }, new CustomResourceOptions { Provider = k8sProvider, DependsOn = { k8sProvider } });
+            }, new CustomResourceOptions { Provider = k8sProvider, DependsOn = { ciliumRelease } });
+
+            _ = new K8s.Core.V1.Secret("ctf-build-gitlab-credentials", new K8s.Types.Inputs.Core.V1.SecretArgs
+            {
+                Metadata = new ObjectMetaArgs
+                {
+                    Name = "gitlab-credentials",
+                    Namespace = "ctf-build",
+                },
+                StringData =
+                {
+                    ["GITLAB_USERNAME"] = clusterOpts.GitlabUsername ?? "oauth2",
+                    ["GITLAB_TOKEN"] = Output.CreateSecret(clusterOpts.GitlabToken ?? string.Empty),
+                },
+            }, new CustomResourceOptions { Provider = k8sProvider, DependsOn = { ctfBuildNamespace } });
 
             _ = new K8s.Core.V1.Secret("ctf-gitlab-credentials", new K8s.Types.Inputs.Core.V1.SecretArgs
             {

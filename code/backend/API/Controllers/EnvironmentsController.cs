@@ -46,6 +46,29 @@ namespace API.Controllers
             }
         }
 
+        [HttpDelete("{name}")]
+        public async Task<IActionResult> Delete(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                return BadRequest("Environment name is required.");
+            }
+
+            try
+            {
+                var result = await environmentService.DestroyEnvironmentAsync(name);
+                return Ok(new { Output = result });
+            }
+            catch (System.Collections.Generic.KeyNotFoundException ex)
+            {
+                return NotFound(ex.Message);
+            }
+            catch (System.Exception ex)
+            {
+                return StatusCode(500, ex.Message);
+            }
+        }
+
         [HttpPost("sync-network")]
         public async Task<IActionResult> SyncNetwork()
         {

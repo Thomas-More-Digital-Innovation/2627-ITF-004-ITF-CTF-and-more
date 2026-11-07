@@ -6,35 +6,99 @@ metadata:
   name: chall-manager
   namespace: ctf
 ---
+# chall-manager only manages challenge instances (Deployment + NodePort Service)
+# inside the isolated ctf-challenges namespace. No cluster-wide rights, no secrets, no exec.
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
+kind: Role
 metadata:
-  name: chall-manager-role
+  name: chall-manager
+  namespace: ctf-challenges
 rules:
-  - apiGroups: [""]
-    resources: ["namespaces", "pods", "pods/exec", "services", "secrets", "configmaps", "persistentvolumeclaims"]
-    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
   - apiGroups: ["apps"]
-    resources: ["deployments", "statefulsets"]
+    resources: ["deployments"]
     verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
-  - apiGroups: ["networking.k8s.io"]
-    resources: ["ingresses", "networkpolicies"]
-    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
-  - apiGroups: ["traefik.io"]
-    resources: ["ingressroutes", "ingressroutetcps", "ingressrouteudps", "middlewares"]
+  - apiGroups: [""]
+    resources: ["services"]
     verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
+kind: RoleBinding
 metadata:
-  name: chall-manager-rolebinding
+  name: chall-manager
+  namespace: ctf-challenges
 roleRef:
   apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: chall-manager-role
+  kind: Role
+  name: chall-manager
 subjects:
   - kind: ServiceAccount
     name: chall-manager
+    namespace: ctf
+---
+# Service account for the ctfd-challenges-sync Job: exec into CTFd (token minting)
+# and run short-lived builder pods in ctf-build.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ctf-sync
+  namespace: ctf
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ctf-sync
+  namespace: ctf
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["ctfd"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ctf-sync
+  namespace: ctf
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ctf-sync
+subjects:
+  - kind: ServiceAccount
+    name: ctf-sync
+    namespace: ctf
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ctf-sync
+  namespace: ctf-build
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "delete", "deletecollection", "get", "list", "patch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ctf-sync
+  namespace: ctf-build
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ctf-sync
+subjects:
+  - kind: ServiceAccount
+    name: ctf-sync
     namespace: ctf
 ---
 apiVersion: v1
@@ -66,6 +130,9 @@ data:
     	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
     	"github.com/pulumi/pulumi/sdk/v3/go/pulumi/config"
     )
+
+    // Untrusted challenge instances live in their own namespace (PSA baseline + NetworkPolicies).
+    const chNS = "ctf-challenges"
 
     func k8sRequest(method, path string, body any) ([]byte, int, error) {
     	token, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
@@ -140,6 +207,16 @@ data:
     			"ports": []map[string]any{
     				{"containerPort": port},
     			},
+    			// Root/setuid is kept (sshd, su, priv-esc challenges need it); the
+    			// user namespace (hostUsers=false) makes that root unprivileged on the node.
+    			"securityContext": map[string]any{
+    				"privileged":   false,
+    				"capabilities": map[string]any{"drop": []string{"NET_RAW", "MKNOD"}},
+    			},
+    			"resources": map[string]any{
+    				"requests": map[string]any{"cpu": "50m", "memory": "64Mi"},
+    				"limits":   map[string]any{"cpu": "500m", "memory": "512Mi", "ephemeral-storage": "1Gi"},
+    			},
     		}
     		if cmdStr := add["command"]; cmdStr != "" {
     			var cmdSlice []string
@@ -159,7 +236,7 @@ data:
     			"kind":       "Deployment",
     			"metadata": map[string]any{
     				"name":      name,
-    				"namespace": "ctf",
+    				"namespace": chNS,
     				"labels":    labels,
     			},
     			"spec": map[string]any{
@@ -168,12 +245,18 @@ data:
     				"template": map[string]any{
     					"metadata": map[string]any{"labels": labels},
     					"spec": map[string]any{
+    						"automountServiceAccountToken": false,
+    						"enableServiceLinks":           false,
+    						"hostUsers":                    false,
+    						"securityContext": map[string]any{
+    							"seccompProfile": map[string]any{"type": "RuntimeDefault"},
+    						},
     						"containers": []map[string]any{container},
     					},
     				},
     			},
     		}
-    		_, code, err := k8sRequest("POST", "/apis/apps/v1/namespaces/ctf/deployments", dep)
+    		_, code, err := k8sRequest("POST", "/apis/apps/v1/namespaces/"+chNS+"/deployments", dep)
     		if err != nil || (code >= 300 && code != 409) {
     			return fmt.Errorf("create deployment failed (%d): %v", code, err)
     		}
@@ -183,7 +266,7 @@ data:
     			"kind":       "Service",
     			"metadata": map[string]any{
     				"name":      name,
-    				"namespace": "ctf",
+    				"namespace": chNS,
     				"labels":    labels,
     			},
     			"spec": map[string]any{
@@ -194,9 +277,9 @@ data:
     				},
     			},
     		}
-    		out, code, err := k8sRequest("POST", "/api/v1/namespaces/ctf/services", svc)
+    		out, code, err := k8sRequest("POST", "/api/v1/namespaces/"+chNS+"/services", svc)
     		if code == 409 {
-    			out, code, err = k8sRequest("GET", "/api/v1/namespaces/ctf/services/"+name, nil)
+    			out, code, err = k8sRequest("GET", "/api/v1/namespaces/"+chNS+"/services/"+name, nil)
     		}
     		if err != nil || code >= 300 {
     			return fmt.Errorf("create service failed (%d): %v", code, err)
@@ -239,6 +322,8 @@ data:
     	"strings"
     	"time"
     )
+
+    const chNS = "ctf-challenges"
 
     const digest = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
 
@@ -290,7 +375,7 @@ data:
     		if err != nil {
     			continue
     		}
-    		req, _ := http.NewRequest("GET", "https://kubernetes.default.svc/apis/apps/v1/namespaces/ctf/deployments?labelSelector=chall-manager.ctfer.io/identity", nil)
+    		req, _ := http.NewRequest("GET", "https://kubernetes.default.svc/apis/apps/v1/namespaces/"+chNS+"/deployments?labelSelector=chall-manager.ctfer.io/identity", nil)
     		req.Header.Set("Authorization", "Bearer "+string(token))
     		resp, err := cli.Do(req)
     		if err != nil {
@@ -312,12 +397,12 @@ data:
     		for _, item := range list.Items {
     			id := item.Metadata.Labels["chall-manager.ctfer.io/identity"]
     			if id != "" && !active[id] && strings.HasPrefix(item.Metadata.Name, "chall-") && time.Since(item.Metadata.CreationTimestamp) > 30*time.Second {
-    				delDep, _ := http.NewRequest("DELETE", "https://kubernetes.default.svc/apis/apps/v1/namespaces/ctf/deployments/"+item.Metadata.Name, nil)
+    				delDep, _ := http.NewRequest("DELETE", "https://kubernetes.default.svc/apis/apps/v1/namespaces/"+chNS+"/deployments/"+item.Metadata.Name, nil)
     				delDep.Header.Set("Authorization", "Bearer "+string(token))
     				if r, err := cli.Do(delDep); err == nil {
     					r.Body.Close()
     				}
-    				delSvc, _ := http.NewRequest("DELETE", "https://kubernetes.default.svc/api/v1/namespaces/ctf/services/"+item.Metadata.Name, nil)
+    				delSvc, _ := http.NewRequest("DELETE", "https://kubernetes.default.svc/api/v1/namespaces/"+chNS+"/services/"+item.Metadata.Name, nil)
     				delSvc.Header.Set("Authorization", "Bearer "+string(token))
     				if r, err := cli.Do(delSvc); err == nil {
     					r.Body.Close()
