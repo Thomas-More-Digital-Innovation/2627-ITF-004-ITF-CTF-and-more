@@ -36,7 +36,6 @@ namespace Infrastructure.Pulumi
         public const string SectionName = "CtfCluster";
 
         public string CiliumVersion { get; set; } = "1.20.4";
-        public string CertManagerVersion { get; set; } = "v1.17.1";
         public string ArgoCdVersion { get; set; } = "7.8.2";
         public string ChallengesRepoUrl { get; set; } = "https://gitlab.com/it-factory-thomas-more/SKIL3/25-26/bsides-ctf/challenges.git";
         public string? GitlabUsername { get; set; }
@@ -238,7 +237,13 @@ namespace Infrastructure.Pulumi
 
             var k8sProvider = new K8s.Provider("k8s-provider", new K8s.ProviderArgs
             {
-                KubeConfig = kubeconfig.KubeconfigRaw,
+                // Bootstrap returns once etcd is started; kube-apiserver comes up some time later.
+                // Hand the kubeconfig to the provider only after the API server answers.
+                KubeConfig = kubeconfig.KubeconfigRaw.Apply(async kc =>
+                {
+                    await WaitForApiServerAsync(firstMasterIp, TimeSpan.FromMinutes(15));
+                    return kc;
+                }),
                 EnableServerSideApply = true,
                 UpsertExistingObjects = true,
             }, new CustomResourceOptions { DependsOn = { kubeconfig } });
@@ -277,26 +282,6 @@ namespace Infrastructure.Pulumi
                 },
             }, new CustomResourceOptions { Provider = k8sProvider, DependsOn = { k8sProvider } });
 
-            var certManagerRelease = new Release("cert-manager", new ReleaseArgs
-            {
-                Name = "cert-manager",
-                Chart = "cert-manager",
-                Version = clusterOpts.CertManagerVersion,
-                Namespace = "cert-manager",
-                CreateNamespace = true,
-                RepositoryOpts = new RepositoryOptsArgs
-                {
-                    Repo = "https://charts.jetstack.io",
-                },
-                Values = new InputMap<object>
-                {
-                    ["crds"] = new Dictionary<string, object>
-                    {
-                        ["enabled"] = true,
-                    },
-                },
-            }, new CustomResourceOptions { Provider = k8sProvider, DependsOn = { ciliumRelease } });
-
             var argoCdRelease = new Release("argocd", new ReleaseArgs
             {
                 Name = "argocd",
@@ -308,38 +293,16 @@ namespace Infrastructure.Pulumi
                 {
                     Repo = "https://argoproj.github.io/argo-helm",
                 },
-            }, new CustomResourceOptions { Provider = k8sProvider, DependsOn = { certManagerRelease } });
-
-            var ctfNamespace = new K8s.Core.V1.Namespace("ctf-namespace", new K8s.Types.Inputs.Core.V1.NamespaceArgs
-            {
-                Metadata = new ObjectMetaArgs
-                {
-                    Name = "ctf",
-                    Labels =
-                    {
-                        ["pod-security.kubernetes.io/enforce"] = "baseline",
-                        ["pod-security.kubernetes.io/audit"] = "baseline",
-                        ["pod-security.kubernetes.io/warn"] = "baseline",
-                    },
-                },
             }, new CustomResourceOptions { Provider = k8sProvider, DependsOn = { ciliumRelease } });
 
-            // Builder pods run privileged against the node's containerd, so they get their own
-            // namespace and only the GitLab credentials they need (no CTFd admin credentials).
-            var ctfBuildNamespace = new K8s.Core.V1.Namespace("ctf-build-namespace", new K8s.Types.Inputs.Core.V1.NamespaceArgs
-            {
-                Metadata = new ObjectMetaArgs
-                {
-                    Name = "ctf-build",
-                    Labels =
-                    {
-                        ["pod-security.kubernetes.io/enforce"] = "privileged",
-                        ["pod-security.kubernetes.io/audit"] = "privileged",
-                        ["pod-security.kubernetes.io/warn"] = "privileged",
-                    },
-                },
-            }, new CustomResourceOptions { Provider = k8sProvider, DependsOn = { ciliumRelease } });
+            // Bootstrap secrets are the only in-cluster objects created here besides ArgoCD and the
+            // app-of-apps: they cannot live in git. Their namespaces are created bare (name only);
+            // labels such as Pod Security levels are owned by code/k8s/ctf/namespace.yaml via ArgoCD.
+            // With server-side apply Pulumi only manages metadata.name, so the two never fight.
+            var ctfNamespace = BareNamespace("ctf", k8sProvider, ciliumRelease);
+            var ctfBuildNamespace = BareNamespace("ctf-build", k8sProvider, ciliumRelease);
 
+            // Builder pods only get the GitLab credentials they need (no CTFd admin credentials).
             _ = new K8s.Core.V1.Secret("ctf-build-gitlab-credentials", new K8s.Types.Inputs.Core.V1.SecretArgs
             {
                 Metadata = new ObjectMetaArgs
@@ -429,6 +392,41 @@ namespace Infrastructure.Pulumi
                 ["talosconfig"] = Output.CreateSecret(clientConfig.Apply(c => c.TalosConfig)),
                 ["kubeconfig"] = Output.CreateSecret(kubeconfig.KubeconfigRaw),
             };
+        }
+
+        private static K8s.Core.V1.Namespace BareNamespace(string name, K8s.Provider provider, Resource dependsOn) =>
+            new($"{name}-namespace", new K8s.Types.Inputs.Core.V1.NamespaceArgs
+            {
+                Metadata = new ObjectMetaArgs { Name = name },
+            }, new CustomResourceOptions { Provider = provider, DependsOn = { dependsOn } });
+
+        private static async Task WaitForApiServerAsync(string host, TimeSpan timeout)
+        {
+            using var http = new HttpClient(new HttpClientHandler
+            {
+                // Only probing liveness; the cluster CA is not trusted by this host.
+                ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator,
+            })
+            { Timeout = TimeSpan.FromSeconds(5) };
+
+            var deadline = DateTime.UtcNow + timeout;
+            while (DateTime.UtcNow < deadline)
+            {
+                try
+                {
+                    // Any HTTP answer (200, or 401/403 without credentials) means the API server is serving.
+                    using var resp = await http.GetAsync($"https://{host}:6443/readyz");
+                    Console.WriteLine($"kube-apiserver on {host} answered ({(int)resp.StatusCode}).");
+                    return;
+                }
+                catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+                {
+                    Console.WriteLine($"Waiting for kube-apiserver on {host}:6443...");
+                    await Task.Delay(TimeSpan.FromSeconds(5));
+                }
+            }
+
+            throw new TimeoutException($"kube-apiserver on {host}:6443 did not come up within {timeout}.");
         }
 
         private static Input<TalosInputs.ClientConfigurationArgs> ClientCfg(TalosSecrets secrets) =>

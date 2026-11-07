@@ -3,6 +3,8 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: ctf
+  annotations:
+    argocd.argoproj.io/sync-wave: "-3"
   labels:
     kubernetes.io/metadata.name: ctf
     pod-security.kubernetes.io/enforce: baseline
