@@ -9,7 +9,7 @@ code - contains all code for the platform
 
 -- frontend contains a Vue.js SPA as an interface to the API
 
--- terraform contains all IaC, including the platforms IaC itself, as well as the environments.
+-- terraform contains the platform (management) IaC. Environments are deployed by the backend via inline C# Pulumi programs.
 
 
 documentation - contains all documentation of meetings, diagrams, etc.
