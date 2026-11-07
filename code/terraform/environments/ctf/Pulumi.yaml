@@ -1,3 +1,0 @@
-name: simple-hcl
-runtime: hcl
-description: A simple Pulumi HCL project
