@@ -62,7 +62,7 @@ namespace Infrastructure.Pulumi
         public int MasterDiskGb { get; set; } = 20;
         public int WorkerCores { get; set; } = 8;
         public int WorkerMemoryMb { get; set; } = 12288;
-        public int WorkerDiskGb { get; set; } = 80;
+        public int WorkerDiskGb { get; set; } = 200;
 
         /// <summary>Public domain CTFd is served on (e.g. ctf.example.com). Empty = plain HTTP on any host.</summary>
         public string? Domain { get; set; }
