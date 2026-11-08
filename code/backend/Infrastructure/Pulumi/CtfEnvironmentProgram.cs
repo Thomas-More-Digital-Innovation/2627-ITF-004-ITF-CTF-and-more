@@ -544,9 +544,10 @@ return hs
                 }
                 // SkipDryRunOnMissingResource: apps may reference CRDs (Certificate, IngressRoute, MariaDB)
                 // that another app is still installing; the retry picks them up once they exist.
+                // RespectIgnoreDifferences: syncs leave the fields in ignoreDifferences (below) alone.
                 syncPolicy["syncOptions"] = app.CreateNamespace
-                    ? new[] { "CreateNamespace=true", "SkipDryRunOnMissingResource=true" }
-                    : new[] { "SkipDryRunOnMissingResource=true" };
+                    ? new[] { "CreateNamespace=true", "SkipDryRunOnMissingResource=true", "RespectIgnoreDifferences=true" }
+                    : new[] { "SkipDryRunOnMissingResource=true", "RespectIgnoreDifferences=true" };
                 syncPolicy["retry"] = new Dictionary<string, object>
                 {
                     ["limit"] = 10,
@@ -571,6 +572,19 @@ return hs
                             ["namespace"] = app.DestinationNamespace,
                         },
                         ["syncPolicy"] = syncPolicy,
+                        // ArgoCD 3.x adds pre-/post-delete-finalizer.argocd.argoproj.io to child Applications
+                        // whose charts have pre/post-delete hooks (longhorn, spegel). Git only lists the
+                        // resources finalizer, so without this the app-of-apps is permanently OutOfSync and
+                        // selfHeal keeps stripping finalizers ArgoCD needs.
+                        ["ignoreDifferences"] = new[]
+                        {
+                            new Dictionary<string, object>
+                            {
+                                ["group"] = "argoproj.io",
+                                ["kind"] = "Application",
+                                ["jsonPointers"] = new[] { "/metadata/finalizers" },
+                            },
+                        },
                     },
                 }, new CustomResourceOptions { Provider = k8sProvider, DependsOn = { argoCdRelease } });
             }
