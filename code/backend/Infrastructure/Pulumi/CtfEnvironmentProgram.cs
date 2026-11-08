@@ -376,6 +376,29 @@ namespace Infrastructure.Pulumi
                 {
                     Repo = "https://argoproj.github.io/argo-helm",
                 },
+                // Since ArgoCD 1.8 child Applications report no health, so sync waves made of
+                // Applications pass immediately. Restore the health check so app-of-apps waves
+                // (operators -> CRs -> ctfd -> ctfd-bootstrap) really wait for each other.
+                Values = new InputMap<object>
+                {
+                    ["configs"] = new Dictionary<string, object>
+                    {
+                        ["cm"] = new Dictionary<string, object>
+                        {
+                            ["resource.customizations.health.argoproj.io_Application"] = @"hs = {}
+hs.status = ""Progressing""
+hs.message = """"
+if obj.status ~= nil and obj.status.health ~= nil then
+  hs.status = obj.status.health.status
+  if obj.status.health.message ~= nil then
+    hs.message = obj.status.health.message
+  end
+end
+return hs
+",
+                        },
+                    },
+                },
             }, new CustomResourceOptions { Provider = k8sProvider, DependsOn = { ciliumRelease } });
 
             // Bootstrap secrets are the only in-cluster objects created here besides ArgoCD and the

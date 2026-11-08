@@ -35,7 +35,7 @@ metadata:
   name: ctf-pool
   namespace: metallb-system
   annotations:
-    argocd.argoproj.io/sync-wave: "0"
+    argocd.argoproj.io/sync-wave: "-1"
     argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
 spec:
   addresses:
@@ -47,7 +47,7 @@ metadata:
   name: ctf-l2
   namespace: metallb-system
   annotations:
-    argocd.argoproj.io/sync-wave: "0"
+    argocd.argoproj.io/sync-wave: "-1"
     argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
 spec:
   ipAddressPools:
