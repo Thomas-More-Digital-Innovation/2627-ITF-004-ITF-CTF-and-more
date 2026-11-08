@@ -1,0 +1,16 @@
+# Deployed by the backend's Pulumi program as the "ctf-edge" ArgoCD Application; these values are
+# overridden from CtfCluster settings (Domain, AcmeEmail, AcmeStaging, CloudflareApiToken).
+
+# Public hostname for CTFd, e.g. ctf.example.com. Empty: CTFd is served over plain HTTP on any host.
+domain: ""
+
+acme:
+  email: ""
+  # Let's Encrypt staging CA: untrusted certificates but no rate limits. Use while testing.
+  staging: false
+  # true when the Cloudflare token Secret (cert-manager/cloudflare-api-token) exists.
+  cloudflare: false
+
+ctfd:
+  service: ctfd-web
+  port: 8000

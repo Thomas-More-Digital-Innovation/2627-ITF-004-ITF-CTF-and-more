@@ -1,0 +1,54 @@
+# CTFd database: 3-node MariaDB Galera cluster (synchronous multi-primary replication).
+# Survives the loss of any one node/pod. mariadb-operator exposes:
+#   ctfd-db-primary  -> the single node CTFd writes to (avoids Galera write conflicts)
+#   ctfd-db          -> all nodes
+# Credentials come from the ctfd-db Secret, created by the backend's Pulumi program.
+apiVersion: k8s.mariadb.com/v1alpha1
+kind: MariaDB
+metadata:
+  name: ctfd-db
+  namespace: ctf
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+spec:
+  rootPasswordSecretKeyRef:
+    name: ctfd-db
+    key: root-password
+  username: ctfd
+  passwordSecretKeyRef:
+    name: ctfd-db
+    key: password
+  database: ctfd
+
+  replicas: 3
+  galera:
+    enabled: true
+
+  # Galera already keeps a full copy per node, so each node uses a single-replica volume.
+  storage:
+    size: 5Gi
+    storageClassName: longhorn-single
+
+  # One Galera node per Kubernetes node, and never take down more than one at a time.
+  affinity:
+    antiAffinityEnabled: true
+  podDisruptionBudget:
+    maxUnavailable: 1
+
+  myCnf: |
+    [mariadb]
+    bind-address=*
+    default_storage_engine=InnoDB
+    binlog_format=row
+    innodb_autoinc_lock_mode=2
+    max_allowed_packet=256M
+    character-set-server=utf8mb4
+    collation-server=utf8mb4_unicode_ci
+
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 1Gi

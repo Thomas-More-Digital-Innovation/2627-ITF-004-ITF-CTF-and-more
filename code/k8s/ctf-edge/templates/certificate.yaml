@@ -1,0 +1,16 @@
+{{- if include "ctf-edge.tls" . }}
+# Covers the CTFd hostname and *.<domain> for HTTP challenges routed by subdomain later on.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ctf-tls
+  namespace: {{ .Release.Namespace }}
+spec:
+  secretName: ctf-tls
+  issuerRef:
+    kind: ClusterIssuer
+    name: {{ include "ctf-edge.issuer" . }}
+  dnsNames:
+    - {{ .Values.domain | quote }}
+    - {{ printf "*.%s" .Values.domain | quote }}
+{{- end }}

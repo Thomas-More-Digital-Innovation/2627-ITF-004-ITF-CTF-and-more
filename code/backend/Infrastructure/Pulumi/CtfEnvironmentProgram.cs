@@ -13,6 +13,9 @@ using K8s = Pulumi.Kubernetes;
 using Pulumi.Kubernetes.Helm.V3;
 using Pulumi.Kubernetes.Types.Inputs.Helm.V3;
 using Pulumi.Kubernetes.Types.Inputs.Meta.V1;
+using Pulumi.Random;
+using TalosSchematic = Pulumiverse.Talos.ImageFactory.Schematic;
+using TalosSchematicArgs = Pulumiverse.Talos.ImageFactory.SchematicArgs;
 
 namespace Infrastructure.Pulumi
 {
@@ -25,7 +28,16 @@ namespace Infrastructure.Pulumi
         public string? ApiToken { get; set; }
         public string? Username { get; set; }
         public string? Password { get; set; }
-        public string NodeName { get; set; } = "pve";
+        /// <summary>
+        /// Proxmox nodes to spread VMs over (round-robin per role, so masters land on different nodes).
+        /// A single entry puts everything on that node. DatastoreId and VnetName must exist on every node.
+        /// </summary>
+        public string[] NodeNames { get; set; } = [];
+
+        public IReadOnlyList<string> EffectiveNodes =>
+            NodeNames.Where(n => !string.IsNullOrWhiteSpace(n)).Distinct().ToArray() is { Length: > 0 } nodes
+                ? nodes
+                : throw new InvalidOperationException("Proxmox:NodeNames must contain at least one node (e.g. Proxmox__NodeNames__0=pve).");
         public string VnetName { get; set; } = "envs";
         public string DatastoreId { get; set; } = "sas-disks";
         public string[] Tags { get; set; } = ["pulumi"];
@@ -43,6 +55,19 @@ namespace Infrastructure.Pulumi
         public string CtfdAdminUser { get; set; } = "admin";
         public string CtfdAdminEmail { get; set; } = "admin@ctf.local";
         public string CtfdAdminPassword { get; set; } = "admin";
+
+        /// <summary>Public domain CTFd is served on (e.g. ctf.example.com). Empty = plain HTTP on any host.</summary>
+        public string? Domain { get; set; }
+        /// <summary>Contact address for the Let's Encrypt account.</summary>
+        public string? AcmeEmail { get; set; }
+        /// <summary>Use the Let's Encrypt staging CA (untrusted certs, no rate limits) while testing.</summary>
+        public bool AcmeStaging { get; set; } = false;
+        /// <summary>Cloudflare API token with Zone:Read and DNS:Edit on the domain's zone, for DNS-01 challenges.</summary>
+        public string? CloudflareApiToken { get; set; }
+        /// <summary>Repo/path of the Helm chart holding the domain-dependent objects (issuer, certificate, routes).</summary>
+        public string EdgeChartRepoUrl { get; set; } = "https://github.com/Thomas-More-Digital-Innovation/2627-ITF-004-ITF-CTF-and-more.git";
+        public string EdgeChartPath { get; set; } = "code/k8s/ctf-edge";
+        public string EdgeChartRevision { get; set; } = "HEAD";
         public List<ArgoCdApplicationConfig> Applications { get; set; } = [];
 
         public static List<ArgoCdApplicationConfig> DefaultApplications =>
@@ -76,6 +101,8 @@ namespace Infrastructure.Pulumi
         public string DestinationNamespace { get; set; } = "default";
         public bool CreateNamespace { get; set; } = true;
         public bool AutomatedSync { get; set; } = true;
+        /// <summary>Optional Helm values (spec.source.helm.valuesObject) for chart or Helm-directory sources.</summary>
+        public Dictionary<string, object>? HelmValues { get; set; }
     }
 
     /// <summary>
@@ -84,8 +111,16 @@ namespace Infrastructure.Pulumi
     public static class CtfEnvironmentProgram
     {
         private const string TalosVersion = "v1.14.4";
-        private const string TalosSchematicId = "ce4c980550dd2ab1b17bbf2b08801c7eb59418eafe8f279833297925d67c7515";
-        private const string TalosIsoUrl = $"https://factory.talos.dev/image/{TalosSchematicId}/{TalosVersion}/nocloud-amd64.iso";
+
+        // Image Factory schematic: qemu-guest-agent for Proxmox, iscsi-tools + util-linux-tools for Longhorn.
+        private const string TalosSchematicYaml = """
+            customization:
+              systemExtensions:
+                officialExtensions:
+                  - siderolabs/iscsi-tools
+                  - siderolabs/qemu-guest-agent
+                  - siderolabs/util-linux-tools
+            """;
 
         private sealed class ArgoCdApplicationResourceArgs : K8s.ApiExtensions.CustomResourceArgs
         {
@@ -99,12 +134,29 @@ namespace Infrastructure.Pulumi
 
         // user.max_user_namespaces: Talos defaults it to 0 (KSPP hardening). Challenge pods run with
         // hostUsers=false so root in a challenge is unprivileged on the node, which needs user namespaces.
-        private static string BuildNodePatch(string ipWithPrefix, string gatewayIp) =>
+        // kubelet.extraMounts: Longhorn keeps replica data in /var/lib/longhorn and needs it bind-mounted
+        // into the kubelet with rshared propagation (Talos guide for Longhorn).
+        // nodeLabels: topology.kubernetes.io/zone = Proxmox host, so Longhorn places replicas (and the
+        // scheduler spreads pods) across physical machines rather than just across VMs.
+        private static string BuildNodePatch(string ipWithPrefix, string gatewayIp, string schematicId, string proxmoxNode) =>
             $$"""
             {
               "machine": {
                 "sysctls": {
                   "user.max_user_namespaces": "11255"
+                },
+                "nodeLabels": {
+                  "topology.kubernetes.io/zone": "{{proxmoxNode}}"
+                },
+                "kubelet": {
+                  "extraMounts": [
+                    {
+                      "destination": "/var/lib/longhorn",
+                      "type": "bind",
+                      "source": "/var/lib/longhorn",
+                      "options": ["bind", "rshared", "rw"]
+                    }
+                  ]
                 },
                 "network": {
                   "nameservers": ["1.1.1.1", "8.8.8.8"],
@@ -120,7 +172,7 @@ namespace Infrastructure.Pulumi
                 },
                 "install": {
                   "disk": "/dev/sda",
-                  "image": "factory.talos.dev/installer/{{TalosSchematicId}}:{{TalosVersion}}",
+                  "image": "factory.talos.dev/installer/{{schematicId}}:{{TalosVersion}}",
                   "wipe": true
                 },
                 "files": [
@@ -148,15 +200,23 @@ namespace Infrastructure.Pulumi
                 ? clusterOpts.Applications
                 : CtfClusterOptions.DefaultApplications;
 
-            var iso = new DownloadFile("talos_iso", new DownloadFileArgs
+            var schematic = new TalosSchematic("talos-schematic", new TalosSchematicArgs
+            {
+                SchematicData = TalosSchematicYaml,
+            });
+
+            // "local" storage is per node, so every node that hosts a VM gets its own copy of the ISO.
+            // The first node keeps the original resource name so existing stacks don't re-download it.
+            var nodes = px.EffectiveNodes;
+            var isos = nodes.Select((node, n) => new DownloadFile(n == 0 ? "talos_iso" : $"talos_iso-{node}", new DownloadFileArgs
             {
                 ContentType = "iso",
                 DatastoreId = "local",
-                NodeName = px.NodeName,
-                Url = TalosIsoUrl,
-                FileName = $"talos-{TalosVersion}-nocloud-qemu-guest-agent.iso",
+                NodeName = node,
+                Url = schematic.Id.Apply(id => $"https://factory.talos.dev/image/{id}/{TalosVersion}/nocloud-amd64.iso"),
+                FileName = schematic.Id.Apply(id => $"talos-{TalosVersion}-{id[..12]}-nocloud.iso"),
                 OverwriteUnmanaged = true,
-            });
+            })).ToList();
 
             var cidrParts = cidr.Split('/');
             var ipParts = cidrParts[0].Split('.');
@@ -171,10 +231,10 @@ namespace Infrastructure.Pulumi
             var workerIps = Enumerable.Range(0, workers).Select(i => $"{baseSubnet}.{21 + i}").ToList();
 
             var masterVms = Enumerable.Range(0, masters)
-                .Select(i => CreateVm(px, iso, vlanId, $"{envName}-master-{i + 1}", $"master-{i}", 600 + i, "master", cores: 2, memory: 4096, diskSize: 20, $"{masterIps[i]}/{prefix}", gatewayIp))
+                .Select(i => CreateVm(px, nodes[i % nodes.Count], isos[i % nodes.Count], vlanId, $"{envName}-master-{i + 1}", $"master-{i}", 600 + i, "master", cores: 2, memory: 4096, diskSize: 20, $"{masterIps[i]}/{prefix}", gatewayIp))
                 .ToList();
             var workerVms = Enumerable.Range(0, workers)
-                .Select(i => CreateVm(px, iso, vlanId, $"{envName}-worker-{i + 1}", $"worker-{i}", 610 + i, "worker", cores: 4, memory: 8192, diskSize: 40, $"{workerIps[i]}/{prefix}", gatewayIp))
+                .Select(i => CreateVm(px, nodes[i % nodes.Count], isos[i % nodes.Count], vlanId, $"{envName}-worker-{i + 1}", $"worker-{i}", 610 + i, "worker", cores: 4, memory: 8192, diskSize: 80, $"{workerIps[i]}/{prefix}", gatewayIp))
                 .ToList();
 
             var clusterName = $"{envName}-cluster";
@@ -193,19 +253,19 @@ namespace Infrastructure.Pulumi
                 Endpoints = masterIps,
             });
 
-            Output<string> MachineConfig(string type, string ip) => Machines.GetConfiguration.Invoke(new Machines.GetConfigurationInvokeArgs
+            Output<string> MachineConfig(string type, string ip, string proxmoxNode) => Machines.GetConfiguration.Invoke(new Machines.GetConfigurationInvokeArgs
             {
                 ClusterName = clusterName,
                 ClusterEndpoint = $"https://{firstMasterIp}:6443",
                 MachineType = type,
                 MachineSecrets = SecretsInput(secrets),
-                ConfigPatches = { BuildNodePatch($"{ip}/{prefix}", gatewayIp) },
+                ConfigPatches = { schematic.Id.Apply(id => BuildNodePatch($"{ip}/{prefix}", gatewayIp, id, proxmoxNode)) },
             }).Apply(r => r.MachineConfiguration);
 
             var cpApplies = masterVms.Select((vm, i) => new ConfigurationApply($"controlplane-{i}", new ConfigurationApplyArgs
             {
                 ClientConfiguration = ClientCfg(secrets),
-                MachineConfigurationInput = MachineConfig("controlplane", masterIps[i]),
+                MachineConfigurationInput = MachineConfig("controlplane", masterIps[i], nodes[i % nodes.Count]),
                 Endpoint = masterIps[i],
                 Node = masterIps[i],
             }, new CustomResourceOptions { DependsOn = { vm } })).ToList();
@@ -213,7 +273,7 @@ namespace Infrastructure.Pulumi
             var workerApplies = workerVms.Select((vm, i) => new ConfigurationApply($"worker-{i}", new ConfigurationApplyArgs
             {
                 ClientConfiguration = ClientCfg(secrets),
-                MachineConfigurationInput = MachineConfig("worker", workerIps[i]),
+                MachineConfigurationInput = MachineConfig("worker", workerIps[i], nodes[i % nodes.Count]),
                 Endpoint = workerIps[i],
                 Node = workerIps[i],
             }, new CustomResourceOptions { DependsOn = { vm } })).ToList();
@@ -340,6 +400,70 @@ namespace Infrastructure.Pulumi
                 },
             }, new CustomResourceOptions { Provider = k8sProvider, DependsOn = { ctfNamespace } });
 
+            // cert-manager reads the Cloudflare token from its own namespace (ClusterIssuer secret refs
+            // resolve against the cert-manager namespace).
+            if (!string.IsNullOrWhiteSpace(clusterOpts.CloudflareApiToken))
+            {
+                var certManagerNamespace = BareNamespace("cert-manager", k8sProvider, ciliumRelease);
+                _ = new K8s.Core.V1.Secret("cloudflare-api-token", new K8s.Types.Inputs.Core.V1.SecretArgs
+                {
+                    Metadata = new ObjectMetaArgs { Name = "cloudflare-api-token", Namespace = "cert-manager" },
+                    StringData = { ["api-token"] = Output.CreateSecret(clusterOpts.CloudflareApiToken) },
+                }, new CustomResourceOptions { Provider = k8sProvider, DependsOn = { certManagerNamespace } });
+            }
+
+            // Database and CTFd session credentials. RandomPassword lives in the stack state, so the values
+            // stay stable across `pulumi up` runs (a new value would lock CTFd out of MariaDB).
+            var dbRootPassword = new RandomPassword("ctfd-db-root-password", new RandomPasswordArgs { Length = 32, Special = false });
+            var dbPassword = new RandomPassword("ctfd-db-password", new RandomPasswordArgs { Length = 32, Special = false });
+            var ctfdSecretKey = new RandomPassword("ctfd-secret-key", new RandomPasswordArgs { Length = 64, Special = false });
+
+            // Consumed by the MariaDB custom resource in code/k8s/ctf/ctfd-db.yaml.
+            _ = new K8s.Core.V1.Secret("ctfd-db", new K8s.Types.Inputs.Core.V1.SecretArgs
+            {
+                Metadata = new ObjectMetaArgs { Name = "ctfd-db", Namespace = "ctf" },
+                StringData =
+                {
+                    ["root-password"] = dbRootPassword.Result,
+                    ["password"] = dbPassword.Result,
+                },
+            }, new CustomResourceOptions { Provider = k8sProvider, DependsOn = { ctfNamespace } });
+
+            // Consumed by the CTFd chart via secret.existingSecret. ctfd-db-primary is the Service
+            // mariadb-operator creates that always points at the Galera node currently taking writes.
+            _ = new K8s.Core.V1.Secret("ctfd-secrets", new K8s.Types.Inputs.Core.V1.SecretArgs
+            {
+                Metadata = new ObjectMetaArgs { Name = "ctfd-secrets", Namespace = "ctf" },
+                StringData =
+                {
+                    ["SECRET_KEY"] = ctfdSecretKey.Result,
+                    ["DATABASE_URL"] = dbPassword.Result.Apply(pw =>
+                        $"mysql+pymysql://ctfd:{pw}@ctfd-db-primary.ctf.svc.cluster.local:3306/ctfd"),
+                },
+            }, new CustomResourceOptions { Provider = k8sProvider, DependsOn = { ctfNamespace } });
+
+            // Domain-dependent objects (ClusterIssuer, Certificate, Traefik routes for CTFd) come from a small
+            // Helm chart in git; the domain itself is only known here, so it is passed as Helm values.
+            var edgeValues = new Dictionary<string, object>
+            {
+                ["domain"] = clusterOpts.Domain ?? string.Empty,
+                ["acme"] = new Dictionary<string, object>
+                {
+                    ["email"] = clusterOpts.AcmeEmail ?? string.Empty,
+                    ["staging"] = clusterOpts.AcmeStaging,
+                    ["cloudflare"] = !string.IsNullOrWhiteSpace(clusterOpts.CloudflareApiToken),
+                },
+            };
+            applications = applications.Append(new ArgoCdApplicationConfig
+            {
+                Name = "ctf-edge",
+                RepoUrl = clusterOpts.EdgeChartRepoUrl,
+                TargetRevision = clusterOpts.EdgeChartRevision,
+                Path = clusterOpts.EdgeChartPath,
+                DestinationNamespace = "ctf",
+                HelmValues = edgeValues,
+            }).ToList();
+
             foreach (var app in applications)
             {
                 var source = new Dictionary<string, object>
@@ -355,6 +479,10 @@ namespace Infrastructure.Pulumi
                 {
                     source["chart"] = app.Chart;
                 }
+                if (app.HelmValues is { Count: > 0 })
+                {
+                    source["helm"] = new Dictionary<string, object> { ["valuesObject"] = app.HelmValues };
+                }
 
                 var syncPolicy = new Dictionary<string, object>();
                 if (app.AutomatedSync)
@@ -365,10 +493,16 @@ namespace Infrastructure.Pulumi
                         ["selfHeal"] = true,
                     };
                 }
-                if (app.CreateNamespace)
+                // SkipDryRunOnMissingResource: apps may reference CRDs (Certificate, IngressRoute, MariaDB)
+                // that another app is still installing; the retry picks them up once they exist.
+                syncPolicy["syncOptions"] = app.CreateNamespace
+                    ? new[] { "CreateNamespace=true", "SkipDryRunOnMissingResource=true" }
+                    : new[] { "SkipDryRunOnMissingResource=true" };
+                syncPolicy["retry"] = new Dictionary<string, object>
                 {
-                    syncPolicy["syncOptions"] = new[] { "CreateNamespace=true" };
-                }
+                    ["limit"] = 10,
+                    ["backoff"] = new Dictionary<string, object> { ["duration"] = "30s", ["factor"] = 2, ["maxDuration"] = "10m" },
+                };
 
                 _ = new K8s.ApiExtensions.CustomResource($"argocd-app-{app.Name}", new ArgoCdApplicationResourceArgs
                 {
@@ -470,7 +604,7 @@ namespace Infrastructure.Pulumi
             };
         }
 
-        private static VmLegacy CreateVm(ProxmoxOptions px, DownloadFile iso, int vlanId, string name, string resourceName, int vmId, string role,
+        private static VmLegacy CreateVm(ProxmoxOptions px, string nodeName, DownloadFile iso, int vlanId, string name, string resourceName, int vmId, string role,
             int cores, int memory, int diskSize, string staticIpWithCidr, string gatewayIp)
         {
             var tags = new List<string> { "talos", role, "ctf" };
@@ -479,7 +613,7 @@ namespace Infrastructure.Pulumi
             return new VmLegacy(resourceName, new VmLegacyArgs
             {
                 Name = name,
-                NodeName = px.NodeName,
+                NodeName = nodeName,
                 VmId = vmId,
                 Tags = tags,
                 Agent = new VmLegacyAgentArgs { Enabled = true },

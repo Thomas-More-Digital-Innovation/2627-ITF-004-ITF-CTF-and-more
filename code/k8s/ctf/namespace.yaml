@@ -65,3 +65,16 @@ metadata:
     pod-security.kubernetes.io/enforce: privileged
     pod-security.kubernetes.io/audit: privileged
     pod-security.kubernetes.io/warn: privileged
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: longhorn-system
+  annotations:
+    argocd.argoproj.io/sync-wave: "-3"
+  labels:
+    kubernetes.io/metadata.name: longhorn-system
+    # Longhorn manager/CSI pods need privileged mode and host mounts
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: privileged

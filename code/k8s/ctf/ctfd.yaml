@@ -21,29 +21,38 @@ spec:
           tag: "3.8.6-0.10.1"
         controller:
           replicas: 1
+          # Uploads live on a ReadWriteOnce volume: the old pod must release it before the new one starts.
+          updateStrategy:
+            type: Recreate
         service:
           type: ClusterIP
         ports:
           http:
             enabled: true
             port: 8000
+        # Routing (HTTP, or HTTPS with a cert-manager certificate when a domain is configured)
+        # lives in the ctf-edge chart (code/k8s/ctf-edge), which the backend deploys with the domain.
         ingressRoute:
-          create: true
-          entryPoints:
-            - web
-          rule: Host(`ctf.local`) || PathPrefix(`/`)
-        # Disabled until a StorageClass is provisioned on the Talos cluster
-        persistentVolumeClaim:
           create: false
+        # SECRET_KEY and DATABASE_URL come from the ctfd-secrets Secret created by the backend's
+        # Pulumi program. The values here are placeholders: the chart only uses the keys.
+        secret:
+          create: false
+          existingSecret: ctfd-secrets
+          values:
+            SECRET_KEY: from-secret
+            DATABASE_URL: from-secret
+        # Uploads and logs on Longhorn (the chart mounts <mountPath>/uploads and <mountPath>/logs
+        # and sets UPLOAD_FOLDER / LOG_FOLDER accordingly).
+        persistentVolumeClaim:
+          create: true
+          mountPath: /var/ctfd
+          accessMode: ReadWriteOnce
+          size: 5Gi
+          storageClassName: longhorn
         env:
           - name: TZ
             value: UTC
-          - name: DATABASE_URL
-            value: sqlite:////data/ctfd.db
-          - name: UPLOAD_FOLDER
-            value: /var/uploads
-          - name: LOG_FOLDER
-            value: /var/log/CTFd
           - name: REVERSE_PROXY
             value: "true"
           - name: PLUGIN_SETTINGS_CM_API_URL
@@ -69,21 +78,9 @@ spec:
               - name: ctfd-theme-bsides
                 mountPath: /theme
         extraVolumes:
-          - name: ctfd-data
-            emptyDir: {}
-          - name: ctfd-uploads
-            emptyDir: {}
-          - name: ctfd-logs
-            emptyDir: {}
           - name: ctfd-theme-bsides
             emptyDir: {}
         extraVolumeMounts:
-          - name: ctfd-data
-            mountPath: /data
-          - name: ctfd-uploads
-            mountPath: /var/uploads
-          - name: ctfd-logs
-            mountPath: /var/log/CTFd
           - name: ctfd-theme-bsides
             mountPath: /opt/CTFd/CTFd/themes/bsides-limburg
   destination:
@@ -95,4 +92,7 @@ spec:
       selfHeal: true
     syncOptions:
       - CreateNamespace=true
+    retry:
+      limit: 10
+      backoff: { duration: 30s, factor: 2, maxDuration: 10m }
 

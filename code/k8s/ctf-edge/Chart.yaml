@@ -1,0 +1,5 @@
+apiVersion: v2
+name: ctf-edge
+description: Domain-dependent edge objects for the CTF platform (ACME issuer, TLS certificate, Traefik routes for CTFd).
+type: application
+version: 0.1.0

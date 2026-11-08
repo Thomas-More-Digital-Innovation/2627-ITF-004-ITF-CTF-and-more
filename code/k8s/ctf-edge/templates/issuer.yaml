@@ -1,0 +1,26 @@
+{{- if include "ctf-edge.tls" . }}
+# ACME DNS-01 via Cloudflare: works for wildcards and needs no inbound port 80 to the cluster.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: {{ include "ctf-edge.issuer" . }}
+spec:
+  acme:
+    email: {{ .Values.acme.email | quote }}
+    {{- if .Values.acme.staging }}
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    {{- else }}
+    server: https://acme-v02.api.letsencrypt.org/directory
+    {{- end }}
+    privateKeySecretRef:
+      name: {{ include "ctf-edge.issuer" . }}-account-key
+    solvers:
+      - dns01:
+          cloudflare:
+            apiTokenSecretRef:
+              name: cloudflare-api-token
+              key: api-token
+        selector:
+          dnsZones:
+            - {{ .Values.domain | quote }}
+{{- end }}

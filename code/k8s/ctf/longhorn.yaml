@@ -1,0 +1,64 @@
+# Distributed block storage for stateful platform workloads (CTFd uploads, MariaDB).
+# Talos prerequisites (iscsi-tools + util-linux-tools extensions, /var/lib/longhorn kubelet mount)
+# are set by the backend's Pulumi program.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: longhorn
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://charts.longhorn.io
+    chart: longhorn
+    targetRevision: 1.13.0
+    helm:
+      valuesObject:
+        # The pre-upgrade hook Job does not work with ArgoCD (it is not run as a Helm hook).
+        preUpgradeChecker:
+          jobEnabled: false
+        persistence:
+          defaultClass: true
+          defaultClassReplicaCount: 3
+          defaultDataLocality: best-effort
+        defaultSettings:
+          defaultReplicaCount: 3
+          defaultDataLocality: best-effort
+          # Replicas must land on different Proxmox hosts (topology.kubernetes.io/zone, set by Talos).
+          # Soft: with a single Proxmox host, volumes still get scheduled.
+          replicaZoneSoftAntiAffinity: true
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: longhorn-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+    retry:
+      limit: 10
+      backoff: { duration: 30s, factor: 2, maxDuration: 10m }
+---
+# Single-replica Longhorn class for workloads that replicate themselves (Galera).
+# Three Galera nodes on the default 3-replica class would store every row nine times.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: longhorn-single
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+provisioner: driver.longhorn.io
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+parameters:
+  numberOfReplicas: "1"
+  dataLocality: strict-local
+  staleReplicaTimeout: "30"
+  fsType: ext4
