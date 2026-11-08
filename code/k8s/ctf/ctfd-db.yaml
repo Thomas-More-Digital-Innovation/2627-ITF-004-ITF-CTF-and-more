@@ -21,6 +21,11 @@ spec:
     key: password
   database: ctfd
 
+  # Pinned to the 11.8 LTS line. MariaDB 12.x auto-names foreign keys "1", "2", ... instead of
+  # "<table>_ibfk_N", and CTFd's Alembic migrations drop FKs by those hard-coded names
+  # (e.g. awards_ibfk_1), so CTFd crash-loops on 12.x. Do not bump to 12.x without checking that.
+  image: mariadb:11.8.9
+
   replicas: 3
   galera:
     enabled: true
