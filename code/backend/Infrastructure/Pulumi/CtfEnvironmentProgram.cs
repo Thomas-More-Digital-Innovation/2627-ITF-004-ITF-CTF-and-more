@@ -97,10 +97,15 @@ namespace Infrastructure.Pulumi
             }
         }
 
+        // user.max_user_namespaces: Talos defaults it to 0 (KSPP hardening). Challenge pods run with
+        // hostUsers=false so root in a challenge is unprivileged on the node, which needs user namespaces.
         private static string BuildNodePatch(string ipWithPrefix, string gatewayIp) =>
             $$"""
             {
               "machine": {
+                "sysctls": {
+                  "user.max_user_namespaces": "11255"
+                },
                 "network": {
                   "nameservers": ["1.1.1.1", "8.8.8.8"],
                   "interfaces": [
