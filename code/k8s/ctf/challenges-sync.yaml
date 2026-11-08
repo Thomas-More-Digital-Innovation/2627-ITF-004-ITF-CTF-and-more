@@ -1,6 +1,6 @@
 # Challenge sync pipeline. Source: code/ctf-sync/
 #
-#   ctf-sync-image  (hook, every ArgoCD sync)  builds code/ctf-sync from GitHub on the shared
+#   ctf-sync-image  (hook, every ArgoCD sync)  builds code/ctf-sync (main) from GitHub on the shared
 #                   buildkitd and pushes registry.ctf-build.svc.cluster.local/ctf/ctf-sync:latest
 #   ctfd-bootstrap  (hook, every ArgoCD sync)  CTFd /setup, admin token -> Secret ctfd-admin-token,
 #                   theme. Idempotent.
@@ -36,7 +36,7 @@ spec:
             - --frontend
             - dockerfile.v0
             - --opt
-            - context=https://github.com/Thomas-More-Digital-Innovation/2627-ITF-004-ITF-CTF-and-more.git#HEAD:code/ctf-sync
+            - context=https://github.com/Thomas-More-Digital-Innovation/2627-ITF-004-ITF-CTF-and-more.git#main:code/ctf-sync
             - --output
             - type=image,name=registry.ctf-build.svc.cluster.local/ctf/ctf-sync:latest,push=true
             - --progress
