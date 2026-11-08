@@ -21,6 +21,22 @@ spec:
         spegel:
           # Talos Linux stores containerd registry mirror configs at /etc/cri/conf.d/hosts
           containerdRegistryConfigPath: /etc/cri/conf.d/hosts
+          # Pull order: local containerd store -> Spegel peers -> Talos-managed mirror -> upstream.
+          # prependExisting keeps the Talos mirrors (CtfEnvironmentProgram.BuildNodePatch) behind
+          # Spegel instead of replacing them:
+          #   registry.ctf-build.svc.cluster.local -> in-cluster registry (NodePort 30500)
+          #   docker.io                            -> registry-cache (NodePort 30501)
+          prependExisting: true
+          # Explicit list: with an empty list Spegel only writes _default/hosts.toml, and containerd
+          # prefers a registry's own hosts.toml (the Talos ones) over _default, skipping Spegel.
+          mirroredRegistries:
+            - https://registry.ctf-build.svc.cluster.local
+            - https://docker.io
+            - https://ghcr.io
+            - https://quay.io
+            - https://registry.k8s.io
+            - https://registry.gitlab.com
+            - https://factory.talos.dev
   destination:
     server: https://kubernetes.default.svc
     namespace: spegel

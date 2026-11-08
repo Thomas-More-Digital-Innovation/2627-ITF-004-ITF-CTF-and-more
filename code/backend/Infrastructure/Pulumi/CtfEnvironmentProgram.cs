@@ -144,8 +144,12 @@ namespace Infrastructure.Pulumi
         // hostUsers=false so root in a challenge is unprivileged on the node, which needs user namespaces.
         // kubelet.extraMounts: Longhorn keeps replica data in /var/lib/longhorn and needs it bind-mounted
         // into the kubelet with rshared propagation (Talos guide for Longhorn).
-        // registries: registry.ctf-build.svc.cluster.local (in-cluster registry, code/k8s/ctf/build-infra.yaml) is pulled
-        // over plain HTTP from the registry NodePort on the node's own IP, which works before cluster DNS.
+        // registries: pull order is local containerd store -> Spegel (prepended to these mirrors, see
+        // code/k8s/ctf/spegel.yaml) -> the endpoints below -> upstream. Both are plain-HTTP NodePorts on
+        // the node's own IP, which work before cluster DNS (code/k8s/ctf/build-infra.yaml):
+        //   registry.ctf-build.svc.cluster.local -> :30500 in-cluster registry (our images)
+        //   docker.io                            -> :30501 registry-cache (Docker Hub pull-through)
+        // If a NodePort isn't up yet (fresh cluster), containerd falls through to the next host.
         // nodeLabels: topology.kubernetes.io/zone = Proxmox host, so Longhorn places replicas (and the
         // scheduler spreads pods) across physical machines rather than just across VMs.
         private static string BuildNodePatch(string ipWithPrefix, string gatewayIp, string schematicId, string proxmoxNode) =>
@@ -162,6 +166,10 @@ namespace Infrastructure.Pulumi
                   "mirrors": {
                     "registry.ctf-build.svc.cluster.local": {
                       "endpoints": ["http://{{ipWithPrefix.Split('/')[0]}}:30500"],
+                      "overridePath": false
+                    },
+                    "docker.io": {
+                      "endpoints": ["http://{{ipWithPrefix.Split('/')[0]}}:30501"],
                       "overridePath": false
                     }
                   }
