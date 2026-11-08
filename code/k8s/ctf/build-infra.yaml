@@ -1,0 +1,247 @@
+# In-cluster build infrastructure (namespace ctf-build), so challenge images can be rebuilt
+# on-site without depending on the internet:
+#
+#   registry        Our own images (challenges + the ctf-sync tool), as registry.ctf-build.svc.cluster.local.
+#   registry-cache  Pull-through cache for Docker Hub, used by buildkitd for base images.
+#                   Warm it before the event by syncing once with internet access.
+#   buildkitd       One long-lived rootless builder with a persistent layer cache.
+#
+# Images are named after the Service's own DNS name (registry.ctf-build.svc.cluster.local), so:
+#   - buildkitd and ctf-sync reach it through normal cluster DNS (plain HTTP, port 80).
+#   - Nodes (containerd), which can't use cluster DNS, get a Talos registry mirror for that name
+#     -> http://<own node IP>:30500 (NodePort), see
+#     code/backend/Infrastructure/Pulumi/CtfEnvironmentProgram.cs.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: registry
+  namespace: ctf-build
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 30Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: registry
+  namespace: ctf-build
+  labels: { app.kubernetes.io/name: registry }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app.kubernetes.io/name: registry }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: registry }
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: registry
+          image: registry:2.8.3
+          env:
+            - { name: REGISTRY_STORAGE_DELETE_ENABLED, value: "true" }
+          ports:
+            - { name: http, containerPort: 5000 }
+          readinessProbe:
+            httpGet: { path: /v2/, port: http }
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { memory: 512Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/registry }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: registry }
+---
+# NodePort 30500 is what containerd on every node pulls from.
+apiVersion: v1
+kind: Service
+metadata:
+  name: registry
+  namespace: ctf-build
+spec:
+  type: NodePort
+  selector: { app.kubernetes.io/name: registry }
+  ports:
+    - { name: http, port: 80, targetPort: http, nodePort: 30500 }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: registry-cache
+  namespace: ctf-build
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 30Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: registry-cache
+  namespace: ctf-build
+  labels: { app.kubernetes.io/name: registry-cache }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app.kubernetes.io/name: registry-cache }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: registry-cache }
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: registry
+          image: registry:2.8.3
+          env:
+            - { name: REGISTRY_PROXY_REMOTEURL, value: "https://registry-1.docker.io" }
+            # Keep cached blobs for the whole event instead of the default 7 days.
+            - { name: REGISTRY_PROXY_TTL, value: "2160h" }
+          ports:
+            - { name: http, containerPort: 5000 }
+          readinessProbe:
+            httpGet: { path: /v2/, port: http }
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { memory: 512Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/registry }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: registry-cache }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: registry-cache
+  namespace: ctf-build
+spec:
+  selector: { app.kubernetes.io/name: registry-cache }
+  ports:
+    - { name: http, port: 5000, targetPort: http }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: buildkitd-config
+  namespace: ctf-build
+data:
+  buildkitd.toml: |
+    [worker.oci]
+      enabled = true
+      # Keep plenty of layer cache around; it is what makes on-site rebuilds fast.
+      gckeepstorage = "40GB"
+    [worker.containerd]
+      enabled = false
+
+    [registry."docker.io"]
+      mirrors = ["registry-cache.ctf-build.svc.cluster.local:5000"]
+    [registry."registry-cache.ctf-build.svc.cluster.local:5000"]
+      http = true
+    [registry."registry.ctf-build.svc.cluster.local"]
+      http = true
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: buildkitd-cache
+  namespace: ctf-build
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: longhorn-single
+  resources:
+    requests:
+      storage: 50Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: buildkitd
+  namespace: ctf-build
+  labels: { app.kubernetes.io/name: buildkitd }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app.kubernetes.io/name: buildkitd }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: buildkitd }
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      containers:
+        - name: buildkitd
+          # Rootless: no privileged container and no host mounts. Needs user namespaces
+          # (enabled via user.max_user_namespaces on Talos) and unconfined seccomp/apparmor.
+          image: moby/buildkit:v0.16.0-rootless
+          args:
+            - --addr
+            - tcp://0.0.0.0:1234
+            - --config
+            - /etc/buildkit/buildkitd.toml
+            - --oci-worker-no-process-sandbox
+          ports:
+            - { name: grpc, containerPort: 1234 }
+          readinessProbe:
+            exec: { command: ["buildctl", "--addr", "tcp://127.0.0.1:1234", "debug", "workers"] }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "1", memory: 2Gi }
+            limits: { memory: 8Gi }
+          securityContext:
+            seccompProfile: { type: Unconfined }
+            appArmorProfile: { type: Unconfined }
+            runAsUser: 1000
+            runAsGroup: 1000
+          volumeMounts:
+            - { name: config, mountPath: /etc/buildkit }
+            - { name: cache, mountPath: /home/user/.local/share/buildkit }
+      securityContext:
+        fsGroup: 1000
+      volumes:
+        - name: config
+          configMap: { name: buildkitd-config }
+        - name: cache
+          persistentVolumeClaim: { claimName: buildkitd-cache }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: buildkitd
+  namespace: ctf-build
+spec:
+  selector: { app.kubernetes.io/name: buildkitd }
+  ports:
+    - { name: grpc, port: 1234, targetPort: grpc }
+---
+# buildkitd's gRPC port is unauthenticated: only the ctf-sync pods may reach it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: buildkitd-ingress
+  namespace: ctf-build
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: buildkitd }
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: ctf }
+          podSelector:
+            matchLabels: { app.kubernetes.io/name: ctf-sync }
+      ports:
+        - { protocol: TCP, port: 1234 }

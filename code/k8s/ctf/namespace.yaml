@@ -11,8 +11,9 @@ metadata:
     pod-security.kubernetes.io/audit: baseline
     pod-security.kubernetes.io/warn: baseline
 ---
-# Short-lived challenge builder pods only. Privileged because they build straight into the
-# node's containerd (k8s.io namespace) so Spegel can peer the images without a registry.
+# Build infrastructure: registry, registry-cache and rootless buildkitd (build-infra.yaml).
+# Not "baseline" because rootless buildkitd needs unconfined seccomp/AppArmor; nothing here is
+# privileged or mounts host paths.
 apiVersion: v1
 kind: Namespace
 metadata:

@@ -144,6 +144,8 @@ namespace Infrastructure.Pulumi
         // hostUsers=false so root in a challenge is unprivileged on the node, which needs user namespaces.
         // kubelet.extraMounts: Longhorn keeps replica data in /var/lib/longhorn and needs it bind-mounted
         // into the kubelet with rshared propagation (Talos guide for Longhorn).
+        // registries: registry.ctf-build.svc.cluster.local (in-cluster registry, code/k8s/ctf/build-infra.yaml) is pulled
+        // over plain HTTP from the registry NodePort on the node's own IP, which works before cluster DNS.
         // nodeLabels: topology.kubernetes.io/zone = Proxmox host, so Longhorn places replicas (and the
         // scheduler spreads pods) across physical machines rather than just across VMs.
         private static string BuildNodePatch(string ipWithPrefix, string gatewayIp, string schematicId, string proxmoxNode) =>
@@ -155,6 +157,14 @@ namespace Infrastructure.Pulumi
                 },
                 "nodeLabels": {
                   "topology.kubernetes.io/zone": "{{proxmoxNode}}"
+                },
+                "registries": {
+                  "mirrors": {
+                    "registry.ctf-build.svc.cluster.local": {
+                      "endpoints": ["http://{{ipWithPrefix.Split('/')[0]}}:30500"],
+                      "overridePath": false
+                    }
+                  }
                 },
                 "kubelet": {
                   "extraMounts": [

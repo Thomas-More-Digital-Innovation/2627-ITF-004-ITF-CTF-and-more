@@ -1,473 +1,161 @@
-# In-cluster Job that automatically initializes CTFd (if not yet set up),
-# mints an admin token directly from CTFd, clones the private GitLab challenges repo,
-# imports/syncs all static challenges via ctfcli, and builds containerized challenges
-# locally into containerd (k8s.io namespace, peered across all nodes by Spegel)
-# and registers them as on-demand per-player dynamic_iac challenges in CTFd.
+# Challenge sync pipeline. Source: code/ctf-sync/
+#
+#   ctf-sync-image  (hook, every ArgoCD sync)  builds code/ctf-sync from GitHub on the shared
+#                   buildkitd and pushes registry.ctf-build.svc.cluster.local/ctf/ctf-sync:latest
+#   ctfd-bootstrap  (hook, every ArgoCD sync)  CTFd /setup, admin token -> Secret ctfd-admin-token,
+#                   theme. Idempotent.
+#   ctf-sync        (CronJob)                   GitLab challenges repo -> builds -> CTFd. Exits in
+#                   about a second when the repo hasn't changed. Run it now with:
+#                     kubectl -n ctf create job --from=cronjob/ctf-sync sync-now
+#                   Force a full re-sync with FORCE_SYNC=true (edit the CronJob or the Job).
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: ctfd-challenges-sync
+  name: ctf-sync-image
   namespace: ctf
   annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: ctf-sync }
+    spec:
+      restartPolicy: OnFailure
+      automountServiceAccountToken: false
+      containers:
+        - name: build
+          image: moby/buildkit:v0.16.0
+          command: ["buildctl"]
+          args:
+            - --addr
+            - tcp://buildkitd.ctf-build.svc.cluster.local:1234
+            - build
+            - --frontend
+            - dockerfile.v0
+            - --opt
+            - context=https://github.com/Thomas-More-Digital-Innovation/2627-ITF-004-ITF-CTF-and-more.git#HEAD:code/ctf-sync
+            - --output
+            - type=image,name=registry.ctf-build.svc.cluster.local/ctf/ctf-sync:latest,push=true
+            - --progress
+            - plain
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ctfd-bootstrap
+  namespace: ctf
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
     argocd.argoproj.io/sync-wave: "2"
-    argocd.argoproj.io/sync-options: Force=true,Replace=true
 spec:
   backoffLimit: 5
   template:
+    metadata:
+      labels: { app.kubernetes.io/name: ctf-sync }
     spec:
       serviceAccountName: ctf-sync
       restartPolicy: OnFailure
       containers:
-        - name: sync
-          image: python:3.11-slim
+        - name: bootstrap
+          image: registry.ctf-build.svc.cluster.local/ctf/ctf-sync:latest
+          imagePullPolicy: Always
+          args: ["ctf_sync.bootstrap"]
           envFrom:
-            - secretRef:
-                name: gitlab-credentials
-                optional: true
+            - secretRef: { name: gitlab-credentials, optional: true }
           env:
-            - name: CTFD_URL
-              value: "http://ctfd-web.ctf.svc.cluster.local:8000"
-            - name: CHALLENGE_HOST
-              value: "10.100.0.21"
-            - name: FORCE_REBUILD
-              value: "false"
-          command:
-            - /bin/bash
-            - -ce
-            - |
-              apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates tar && rm -rf /var/lib/apt/lists/*
-              curl -fsSL "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl
-              chmod +x /usr/local/bin/kubectl
-
-              pip install --no-cache-dir ctfcli requests pyyaml
-
-              echo "[*] Waiting for CTFd at ${CTFD_URL}..."
-              until curl -sf "${CTFD_URL}/healthcheck" > /dev/null; do
-                sleep 3
-              done
-
-              if [ -z "${GITLAB_TOKEN:-}" ]; then
-                echo "[!] GITLAB_TOKEN is not set in Secret 'gitlab-credentials'. Skipping private repo clone."
-                exit 0
-              fi
-
-              python3 - << 'PYEOF'
-              import json, os, re, subprocess, sys
-              from pathlib import Path
-              import requests
-              import yaml
-
-              ctfd_url = os.environ["CTFD_URL"].rstrip("/")
-              admin_user = os.environ.get("CTFD_ADMIN_USER", "admin")
-              admin_email = os.environ.get("CTFD_ADMIN_EMAIL", "admin@ctf.local")
-              admin_password = os.environ.get("CTFD_ADMIN_PASSWORD", "admin")
-              challenge_host = os.environ.get("CHALLENGE_HOST", "10.100.0.50")
-              force_rebuild = os.environ.get("FORCE_REBUILD", "false").lower() in ("true", "1", "yes")
-              repo_url = os.environ.get(
-                  "CHALLENGES_REPO_URL",
-                  "https://gitlab.com/it-factory-thomas-more/SKIL3/25-26/bsides-ctf/challenges.git",
-              )
-              gitlab_user = os.environ.get("GITLAB_USERNAME", "oauth2")
-              gitlab_token = os.environ["GITLAB_TOKEN"]
-
-              session = requests.Session()
-
-              # 1. Auto-complete CTFd /setup if not yet configured
-              r = session.get(f"{ctfd_url}/setup", allow_redirects=False)
-              if r.status_code == 200:
-                  print("[*] Performing initial CTFd setup...")
-                  nonce_match = re.search(r"['\"]?csrfNonce['\"]?\s*:\s*['\"]([^'\"]+)['\"]", r.text)
-                  if not nonce_match:
-                      nonce_match = re.search(r'name="nonce"[^>]*value="([^"]+)"', r.text)
-                  nonce = nonce_match.group(1)
-                  setup_data = {
-                      "ctf_name": "CyberKit CTF",
-                      "ctf_description": "CyberKit CTF Environment",
-                      "user_mode": "users",
-                      "name": admin_user,
-                      "email": admin_email,
-                      "password": admin_password,
-                      "ctf_theme": "bsides-limburg",
-                      "nonce": nonce,
-                  }
-                  resp = session.post(f"{ctfd_url}/setup", data=setup_data)
-                  resp.raise_for_status()
-              else:
-                  print("[*] CTFd already initialized.")
-
-              # 2. Mint an admin API token directly inside the CTFd pod
-              mint_cmd = [
-                  "kubectl", "exec", "-n", "ctf", "deploy/ctfd", "--",
-                  "python3", "-c",
-                  (
-                      "from CTFd import create_app; "
-                      "from CTFd.models import Users; "
-                      "from CTFd.utils.security.auth import generate_user_token; "
-                      "app = create_app()\n"
-                      "with app.app_context():\n"
-                      "    admin = Users.query.filter_by(type='admin').first()\n"
-                      "    tok = generate_user_token(admin, expiration=None, description='in-cluster-ctfcli-sync')\n"
-                      "    print('MINTED_TOKEN=' + tok.value)\n"
-                  ),
-              ]
-              mint_out = subprocess.check_output(mint_cmd, text=True)
-              access_token = re.search(r"MINTED_TOKEN=(\S+)", mint_out).group(1)
-              print("[*] Minted CTFd admin API token successfully.")
-
-              api_headers = {
-                  "Authorization": f"Token {access_token}",
-                  "Content-Type": "application/json",
-              }
-
-              # Ensure bsides-limburg theme is active
-              try:
-                  theme_patch = requests.patch(
-                      f"{ctfd_url}/api/v1/configs",
-                      headers=api_headers,
-                      json={"ctf_theme": "bsides-limburg"},
-                  )
-                  if theme_patch.ok:
-                      print("[*] Active CTFd theme set to bsides-limburg.")
-                  else:
-                      print(f"[!] Warning: Failed to set theme ({theme_patch.status_code}): {theme_patch.text}")
-              except Exception as e:
-                  print(f"[!] Warning: Exception updating theme: {e}")
-
-              # 3. Clone private GitLab challenges repo
-              authed_url = repo_url.replace("https://", f"https://{gitlab_user}:{gitlab_token}@")
-              work_dir = Path("/tmp/challenges")
-              subprocess.run(["git", "clone", "--depth=1", authed_url, str(work_dir)], check=True)
-
-              # 4. Write .ctf/config and run ctfd-cli-autorun_all_teams.py if static challenges are not yet synced
-              existing_resp = requests.get(f"{ctfd_url}/api/v1/challenges?view=admin", headers=api_headers)
-              existing_resp.raise_for_status()
-              existing_list = existing_resp.json().get("data", [])
-
-              if len(existing_list) < 50:
-                  ctf_dir = work_dir / ".ctf"
-                  ctf_dir.mkdir(exist_ok=True)
-                  (ctf_dir / "config").write_text(
-                      f"[config]\nurl = {ctfd_url}\naccess_token = {access_token}\n\n[challenges]\n"
-                  )
-                  subprocess.run([sys.executable, "ctfd-cli-autorun_all_teams.py"], cwd=work_dir, check=False)
-                  existing_resp = requests.get(f"{ctfd_url}/api/v1/challenges?view=admin", headers=api_headers)
-                  existing_resp.raise_for_status()
-                  existing_list = existing_resp.json().get("data", [])
-              else:
-                  print(f"[*] {len(existing_list)} challenges already present in CTFd, skipping full ctfcli static re-sync.")
-
-              # 5. Build containerized challenges in parallel by spawning a Pod per build across worker nodes
-              DYNAMIC_CHALLENGES = [
-                  ("Team A1/The-13th-Cabin", ".", "Dockerfile", 5000, "http", None),
-                  ("Team A1/camp-forest-green-found-footage", "web", "Dockerfile", 5000, "http", None),
-                  ("Team A1/crystal_lake", ".", "Dockerfile", 80, "http", None),
-                  ("Team A1/devils-jackpot", ".", "Dockerfile", 5000, "http", None),
-                  ("Team A1/flappy bird", ".", "Dockerfile", 80, "http", None),
-                  ("Team A1/linux-jail-escape", "jail", "Dockerfile", 80, "http", ["/usr/local/bin/ttyd", "-p", "80", "su", "-", "prisoner"]),
-                  ("Team A1/path-traversal-challenge", ".", "Dockerfile", 3000, "http", None),
-                  ("Team A1/physical_puzzle", ".", "Dockerfile", 80, "http", None),
-                  ("Team A1/spectral-challenge", "web", "Dockerfile", 5000, "http", None),
-                  ("Team A1/whitespace-challenge", "web", "Dockerfile", 80, "http", None),
-                  ("Team A2/windows master quest", ".", "Dockerfile", 5000, "http", None),
-                  ("Team A3/Misc_Character_Guessing", "assets", "Dockerfile", 3000, "http", None),
-                  ("Team A3/PWN_Priv_Escalation_Part-1", "assets", "Dockerfile", 22, "ssh", None),
-                  ("Team A3/PWN_Priv_Escalation_Part-2", "assets", "Dockerfile", 22, "ssh", None),
-                  ("Team A3/Web_Client_Auth", "assets", "Dockerfile", 80, "http", None),
-                  ("Team A3/Web_Command_Injection", "assets", "Dockerfile", 5000, "http", None),
-                  ("Team A3/Web_Redirecting", "assets", "Dockerfile", 3000, "http", None),
-              ]
-
-              existing_by_name = {c["name"]: c for c in existing_list}
-              to_build = []
-              chall_configs = []
-
-              for rel_path, ctx_subdir, dockerfile_name, port, proto, cmd_override in DYNAMIC_CHALLENGES:
-                  chall_dir = work_dir / rel_path
-                  chall_yml = chall_dir / "challenge.yml"
-                  if not chall_yml.exists():
-                      print(f"[!] Missing {chall_yml}, skipping")
-                      continue
-
-                  meta = yaml.safe_load(chall_yml.read_text())
-                  name = meta["name"]
-                  old = existing_by_name.get(name)
-                  slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-                  image_ref = f"ctf.local/challenges/{slug}:latest"
-                  build_ctx = chall_dir / ctx_subdir
-                  df_path = build_ctx / dockerfile_name
-
-                  fl_val = ""
-                  first_flag = meta.get("flags", [])
-                  if first_flag:
-                      fl_val = first_flag[0] if isinstance(first_flag[0], str) else first_flag[0].get("content", "")
-
-                  chall_info = {
-                      "rel_path": rel_path,
-                      "ctx_subdir": ctx_subdir,
-                      "dockerfile_name": dockerfile_name,
-                      "port": port,
-                      "proto": proto,
-                      "cmd_override": cmd_override,
-                      "meta": meta,
-                      "name": name,
-                      "old": old,
-                      "slug": slug,
-                      "image_ref": image_ref,
-                      "flag_val": fl_val,
-                  }
-                  chall_configs.append(chall_info)
-
-                  if not force_rebuild and (old and old.get("type") == "dynamic_iac"):
-                      print(f"[*] Challenge '{name}' already registered as dynamic_iac in CTFd, skipping build.")
-                  else:
-                      to_build.append(chall_info)
-
-              # Dispatch parallel builder pods across the worker nodes
-              if to_build:
-                  import time
-                  print(f"\n[*] Dispatching {len(to_build)} parallel builder pods across the cluster...")
-                  spawned_pods = []
-                  for c in to_build:
-                      pod_name = f"chall-build-{c['slug']}"
-                      spawned_pods.append((pod_name, c))
-                      pod_dict = {
-                          "apiVersion": "v1",
-                          "kind": "Pod",
-                          "metadata": {
-                              "name": pod_name,
-                              "namespace": "ctf-build",
-                              "labels": {
-                                  "app.kubernetes.io/name": "challenge-builder",
-                                  "ctf.local/challenge": c["slug"],
-                              },
-                          },
-                          "spec": {
-                              "restartPolicy": "Never",
-                              "automountServiceAccountToken": False,
-                              "enableServiceLinks": False,
-                              "initContainers": [
-                                  {
-                                      "name": "buildkitd",
-                                      "image": "moby/buildkit:v0.16.0",
-                                      "restartPolicy": "Always",
-                                      "args": [
-                                          "--addr",
-                                          "tcp://127.0.0.1:1234",
-                                          "--oci-worker=true",
-                                          "--containerd-worker=false",
-                                      ],
-                                      "securityContext": {"privileged": True},
-                                  }
-                              ],
-                              "containers": [
-                                  {
-                                      "name": "builder",
-                                      "image": "alpine:3.20",
-                                      "envFrom": [
-                                          {"secretRef": {"name": "gitlab-credentials", "optional": True}}
-                                      ],
-                                      "env": [
-                                          {"name": "BUILDKIT_HOST", "value": "tcp://127.0.0.1:1234"},
-                                          {"name": "CHALL_REPO_URL", "value": repo_url},
-                                          {"name": "CHALL_REL_PATH", "value": c["rel_path"]},
-                                          {"name": "CHALL_CTX_SUBDIR", "value": c["ctx_subdir"]},
-                                          {"name": "DOCKERFILE_NAME", "value": c["dockerfile_name"]},
-                                          {"name": "IMAGE_REF", "value": c["image_ref"]},
-                                          {"name": "FLAG_CONTENT", "value": c["flag_val"]},
-                                      ],
-                                      "volumeMounts": [
-                                          {"name": "containerd-sock", "mountPath": "/run/containerd/containerd.sock"},
-                                          {"name": "containerd-root", "mountPath": "/var/lib/containerd"},
-                                      ],
-                                      "command": [
-                                          "/bin/sh",
-                                          "-ce",
-                                          (
-                                              "apk add --no-cache git curl ca-certificates tar\n"
-                                              "curl -fsSL https://github.com/containerd/nerdctl/releases/download/v1.7.7/nerdctl-1.7.7-linux-amd64.tar.gz | tar -xz -C /usr/local/bin nerdctl\n"
-                                              "curl -fsSL https://github.com/moby/buildkit/releases/download/v0.16.0/buildkit-v0.16.0.linux-amd64.tar.gz | tar -xz -C /usr/local bin/buildctl\n"
-                                              "until buildctl debug workers > /dev/null 2>&1; do sleep 1; done\n"
-                                              "AUTH=\"\"\n"
-                                              "if [ -n \"$GITLAB_TOKEN\" ]; then AUTH=\"${GITLAB_USERNAME:-oauth2}:${GITLAB_TOKEN}@\"; fi\n"
-                                              "AUTHED_URL=\"$(echo \"$CHALL_REPO_URL\" | sed \"s|https://|https://${AUTH}|\")\"\n"
-                                              "echo \"[*] Sparse cloning ${CHALL_REL_PATH}...\"\n"
-                                              "git clone --depth 1 --filter=blob:none --sparse \"$AUTHED_URL\" /tmp/repo\n"
-                                              "cd /tmp/repo && git sparse-checkout set \"$CHALL_REL_PATH\"\n"
-                                              "BUILD_CTX=\"/tmp/repo/${CHALL_REL_PATH}/${CHALL_CTX_SUBDIR}\"\n"
-                                              "DF_PATH=\"${BUILD_CTX}/${DOCKERFILE_NAME}\"\n"
-                                              "if [ -n \"$FLAG_CONTENT\" ] && [ ! -f \"${BUILD_CTX}/flag.txt\" ]; then\n"
-                                              "  if grep -q \"flag.txt\" \"$DF_PATH\" 2>/dev/null; then echo \"$FLAG_CONTENT\" > \"${BUILD_CTX}/flag.txt\"; fi\n"
-                                              "fi\n"
-                                              "echo \"[*] Building ${IMAGE_REF} ...\"\n"
-                                              "nerdctl --namespace k8s.io build -t \"$IMAGE_REF\" -f \"$DF_PATH\" \"$BUILD_CTX\"\n"
-                                              "echo \"[+] Successfully built ${IMAGE_REF}\"\n"
-                                          ),
-                                      ],
-                                  }
-                              ],
-                              "volumes": [
-                                  {
-                                      "name": "containerd-sock",
-                                      "hostPath": {
-                                          "path": "/run/containerd/containerd.sock",
-                                          "type": "Socket",
-                                      },
-                                  },
-                                  {
-                                      "name": "containerd-root",
-                                      "hostPath": {
-                                          "path": "/var/lib/containerd",
-                                          "type": "Directory",
-                                      },
-                                  },
-                              ],
-                          },
-                      }
-                      pod_manifest = yaml.dump(pod_dict)
-                      subprocess.run(["kubectl", "apply", "-f", "-"], input=pod_manifest, text=True, check=True)
-
-                  start_time = time.time()
-                  print(f"[*] Waiting for {len(spawned_pods)} parallel builder pods to complete...")
-                  completed_pods = set()
-                  failed_pods = set()
-
-                  while len(completed_pods) + len(failed_pods) < len(spawned_pods):
-                      time.sleep(3)
-                      for pod_name, c in spawned_pods:
-                          if pod_name in completed_pods or pod_name in failed_pods:
-                              continue
-                          p_check = subprocess.run(
-                              ["kubectl", "get", "pod", "-n", "ctf-build", pod_name, "-o", "jsonpath={.status.phase}"],
-                              capture_output=True,
-                              text=True,
-                          )
-                          phase = p_check.stdout.strip()
-                          if phase == "Succeeded":
-                              completed_pods.add(pod_name)
-                              print(f"[+] [{len(completed_pods)}/{len(spawned_pods)}] Build succeeded for {c['name']} (pod: {pod_name})")
-                          elif phase == "Failed":
-                              failed_pods.add(pod_name)
-                              print(f"[!] Build FAILED for {c['name']} (pod: {pod_name})")
-                              err_logs = subprocess.run(
-                                  ["kubectl", "logs", "-n", "ctf-build", pod_name, "-c", "builder", "--tail=30"],
-                                  capture_output=True,
-                                  text=True,
-                              )
-                              print(f"--- Logs for {pod_name} ---\n{err_logs.stdout}\n---")
-                      if time.time() - start_time > 900:
-                          print("[!] Timeout after 15 minutes waiting for builder pods.")
-                          break
-
-                  print(f"[*] Parallel build finished in {int(time.time() - start_time)}s: {len(completed_pods)} succeeded, {len(failed_pods)} failed.")
-
-                  # Clean up builder pods
-                  subprocess.run(["kubectl", "delete", "pods", "-n", "ctf-build", "-l", "app.kubernetes.io/name=challenge-builder", "--ignore-not-found"], check=False)
-
-              # Register dynamic_iac challenges in CTFd
-              for c in chall_configs:
-                  name = c["name"]
-                  old = c["old"]
-                  image_ref = c["image_ref"]
-                  port = c["port"]
-                  proto = c["proto"]
-                  cmd_override = c["cmd_override"]
-                  meta = c["meta"]
-                  chall_dir = work_dir / c["rel_path"]
-
-                  # Remove old 'standard' challenge of the same name so we can replace with 'dynamic_iac'
-                  if old and old.get("type") != "dynamic_iac":
-                      print(f"[*] Converting '{name}' (id={old['id']}) from {old.get('type')} to dynamic_iac...")
-                      requests.delete(f"{ctfd_url}/api/v1/challenges/{old['id']}", headers=api_headers)
-                      old = None
-
-                  additional_cfg = {
-                      "image": image_ref,
-                      "port": str(port),
-                      "protocol": proto,
-                      "host": challenge_host,
-                  }
-                  if cmd_override:
-                      additional_cfg["command"] = json.dumps(cmd_override)
-
-                  val = int(meta.get("value", 100))
-                  payload = {
-                      "name": name,
-                      "category": meta.get("category", "Misc"),
-                      "description": meta.get("description", ""),
-                      "attribution": meta.get("attribution", meta.get("author", "")),
-                      "value": val,
-                      "initial": val,
-                      "minimum": val,
-                      "decay": 100,
-                      "function": "linear",
-                      "state": meta.get("state", "visible"),
-                      "type": "dynamic_iac",
-                      "scenario": "localhost:5000/scenarios/k8s-monopod:latest",
-                      "timeout": 900,
-                      "destroy_on_flag": True,
-                      "shared": False,
-                      "mana_cost": 0,
-                      "additional": json.dumps(additional_cfg),
-                  }
-
-                  if old and old.get("type") == "dynamic_iac":
-                      cid = old["id"]
-                      r = requests.patch(f"{ctfd_url}/api/v1/challenges/{cid}", headers=api_headers, json=payload)
-                      if r.ok:
-                          print(f"[+] Updated dynamic_iac challenge '{name}' (id={cid})")
-                          continue
-                      print(f"[*] Re-registering '{name}' (id={cid}) in chall-manager...")
-                      requests.delete(f"{ctfd_url}/api/v1/challenges/{cid}", headers=api_headers)
-
-                  r = requests.post(f"{ctfd_url}/api/v1/challenges", headers=api_headers, json=payload)
-                  if not r.ok:
-                      print(f"[!] Failed to create dynamic_iac challenge '{name}': {r.status_code} {r.text}")
-                      continue
-                  cid = r.json()["data"]["id"]
-                  print(f"[+] Created dynamic_iac challenge '{name}' (id={cid})")
-
-                  # Attach flags
-                  for fl in meta.get("flags", []):
-                      if isinstance(fl, str):
-                          fl_payload = {"challenge_id": cid, "type": "static", "content": fl, "data": ""}
-                      else:
-                          fl_payload = {
-                              "challenge_id": cid,
-                              "type": fl.get("type", "static"),
-                              "content": fl.get("content", ""),
-                              "data": fl.get("data", ""),
-                          }
-                      requests.post(f"{ctfd_url}/api/v1/flags", headers=api_headers, json=fl_payload)
-
-                  # Attach tags
-                  for tg in meta.get("tags", []):
-                      val_tg = tg.get("value") if isinstance(tg, dict) else str(tg)
-                      requests.post(f"{ctfd_url}/api/v1/tags", headers=api_headers, json={"challenge_id": cid, "value": val_tg})
-
-                  # Attach hints
-                  for ht in meta.get("hints", []) or meta.get("hint", []):
-                      if isinstance(ht, str):
-                          ht_payload = {"challenge_id": cid, "content": ht, "cost": 0}
-                      else:
-                          ht_payload = {
-                              "challenge_id": cid,
-                              "content": ht.get("content", ""),
-                              "cost": int(ht.get("cost", 0)),
-                          }
-                          if ht.get("title"):
-                              ht_payload["title"] = ht["title"]
-                      requests.post(f"{ctfd_url}/api/v1/hints", headers=api_headers, json=ht_payload)
-
-                  # Attach downloadable files
-                  for fpath in meta.get("files", []):
-                      full_f = chall_dir / fpath
-                      if full_f.exists():
-                          with full_f.open("rb") as fp:
-                              requests.post(
-                                  f"{ctfd_url}/api/v1/files",
-                                  headers={"Authorization": f"Token {access_token}"},
-                                  files={"file": (full_f.name, fp)},
-                                  data={"challenge_id": cid, "type": "challenge"},
-                              )
-              PYEOF
-
+            - { name: CTFD_URL, value: "http://ctfd-web.ctf.svc.cluster.local:8000" }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ctf-sync-repo
+  namespace: ctf
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: longhorn-single
+  resources:
+    requests:
+      storage: 5Gi
+---
+# Which challenges are containerized, and how to run them. A `deploy:` block with the same
+# keys inside a challenge's challenge.yml overrides its entry here.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ctf-sync-challenges
+  namespace: ctf
+data:
+  dynamic-challenges.yaml: |
+    - { path: "Team A1/The-13th-Cabin", port: 5000 }
+    - { path: "Team A1/camp-forest-green-found-footage", context: web, port: 5000 }
+    - { path: "Team A1/crystal_lake", port: 80 }
+    - { path: "Team A1/devils-jackpot", port: 5000 }
+    - { path: "Team A1/flappy bird", port: 80 }
+    - { path: "Team A1/linux-jail-escape", context: jail, port: 80, command: ["/usr/local/bin/ttyd", "-p", "80", "su", "-", "prisoner"] }
+    - { path: "Team A1/path-traversal-challenge", port: 3000 }
+    - { path: "Team A1/physical_puzzle", port: 80 }
+    - { path: "Team A1/spectral-challenge", context: web, port: 5000 }
+    - { path: "Team A1/whitespace-challenge", context: web, port: 80 }
+    - { path: "Team A2/windows master quest", port: 5000 }
+    - { path: "Team A3/Misc_Character_Guessing", context: assets, port: 3000 }
+    - { path: "Team A3/PWN_Priv_Escalation_Part-1", context: assets, port: 22, protocol: ssh }
+    - { path: "Team A3/PWN_Priv_Escalation_Part-2", context: assets, port: 22, protocol: ssh }
+    - { path: "Team A3/Web_Client_Auth", context: assets, port: 80 }
+    - { path: "Team A3/Web_Command_Injection", context: assets, port: 5000 }
+    - { path: "Team A3/Web_Redirecting", context: assets, port: 3000 }
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ctf-sync
+  namespace: ctf
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  schedule: "*/5 * * * *"
+  # The repo PVC is ReadWriteOnce and runs must not interleave.
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 120
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 1800
+      template:
+        metadata:
+          labels: { app.kubernetes.io/name: ctf-sync }
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          containers:
+            - name: sync
+              image: registry.ctf-build.svc.cluster.local/ctf/ctf-sync:latest
+              imagePullPolicy: Always
+              args: ["ctf_sync.sync"]
+              envFrom:
+                - secretRef: { name: gitlab-credentials, optional: true }
+              env:
+                - { name: CTFD_URL, value: "http://ctfd-web.ctf.svc.cluster.local:8000" }
+                - { name: CHALLENGE_HOST, value: "10.100.0.21" }
+                - { name: CHALLENGES_BRANCH, value: "" } # empty = repo default branch
+                - { name: FORCE_SYNC, value: "false" }
+                - { name: BUILD_CONCURRENCY, value: "4" }
+                - name: CTFD_TOKEN
+                  valueFrom:
+                    secretKeyRef: { name: ctfd-admin-token, key: token, optional: true }
+              resources:
+                requests: { cpu: 100m, memory: 256Mi }
+                limits: { memory: 1Gi }
+              volumeMounts:
+                - { name: data, mountPath: /data }
+                - { name: challenges, mountPath: /config }
+          volumes:
+            - name: data
+              persistentVolumeClaim: { claimName: ctf-sync-repo }
+            - name: challenges
+              configMap: { name: ctf-sync-challenges }

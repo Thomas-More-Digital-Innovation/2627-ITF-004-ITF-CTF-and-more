@@ -35,8 +35,8 @@ subjects:
     name: chall-manager
     namespace: ctf
 ---
-# Service account for the ctfd-challenges-sync Job: exec into CTFd (token minting)
-# and run short-lived builder pods in ctf-build.
+# Service account for the ctfd-bootstrap Job: exec into CTFd to mint the admin token and
+# store it in the ctfd-admin-token Secret. The ctf-sync CronJob itself needs no API access.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -59,39 +59,20 @@ rules:
   - apiGroups: [""]
     resources: ["pods/exec"]
     verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["ctfd-admin-token"]
+    verbs: ["get", "patch"]
+  # create cannot be limited by resourceNames
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: ctf-sync
   namespace: ctf
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: ctf-sync
-subjects:
-  - kind: ServiceAccount
-    name: ctf-sync
-    namespace: ctf
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: ctf-sync
-  namespace: ctf-build
-rules:
-  - apiGroups: [""]
-    resources: ["pods"]
-    verbs: ["create", "delete", "deletecollection", "get", "list", "patch"]
-  - apiGroups: [""]
-    resources: ["pods/log"]
-    verbs: ["get"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: ctf-sync
-  namespace: ctf-build
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
