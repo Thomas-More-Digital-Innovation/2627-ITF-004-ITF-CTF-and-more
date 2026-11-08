@@ -68,19 +68,5 @@ namespace API.Controllers
                 return StatusCode(500, ex.Message);
             }
         }
-
-        [HttpPost("sync-network")]
-        public async Task<IActionResult> SyncNetwork()
-        {
-            try
-            {
-                await environmentService.SyncManagementTerraformAsync();
-                return Ok(new { Message = "Management network configuration synced successfully." });
-            }
-            catch (System.Exception ex)
-            {
-                return StatusCode(500, ex.Message);
-            }
-        }
     }
 }
