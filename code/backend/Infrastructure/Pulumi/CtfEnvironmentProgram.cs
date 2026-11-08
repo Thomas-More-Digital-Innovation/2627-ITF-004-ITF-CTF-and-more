@@ -56,6 +56,14 @@ namespace Infrastructure.Pulumi
         public string CtfdAdminEmail { get; set; } = "admin@ctf.local";
         public string CtfdAdminPassword { get; set; } = "admin";
 
+        // VM sizing (memory in MiB, disk in GiB). Spread round-robin over Proxmox:NodeNames.
+        public int MasterCores { get; set; } = 4;
+        public int MasterMemoryMb { get; set; } = 8192;
+        public int MasterDiskGb { get; set; } = 20;
+        public int WorkerCores { get; set; } = 8;
+        public int WorkerMemoryMb { get; set; } = 12288;
+        public int WorkerDiskGb { get; set; } = 80;
+
         /// <summary>Public domain CTFd is served on (e.g. ctf.example.com). Empty = plain HTTP on any host.</summary>
         public string? Domain { get; set; }
         /// <summary>Contact address for the Let's Encrypt account.</summary>
@@ -231,10 +239,10 @@ namespace Infrastructure.Pulumi
             var workerIps = Enumerable.Range(0, workers).Select(i => $"{baseSubnet}.{21 + i}").ToList();
 
             var masterVms = Enumerable.Range(0, masters)
-                .Select(i => CreateVm(px, nodes[i % nodes.Count], isos[i % nodes.Count], vlanId, $"{envName}-master-{i + 1}", $"master-{i}", 600 + i, "master", cores: 2, memory: 4096, diskSize: 20, $"{masterIps[i]}/{prefix}", gatewayIp))
+                .Select(i => CreateVm(px, nodes[i % nodes.Count], isos[i % nodes.Count], vlanId, $"{envName}-master-{i + 1}", $"master-{i}", 600 + i, "master", cores: clusterOpts.MasterCores, memory: clusterOpts.MasterMemoryMb, diskSize: clusterOpts.MasterDiskGb, $"{masterIps[i]}/{prefix}", gatewayIp))
                 .ToList();
             var workerVms = Enumerable.Range(0, workers)
-                .Select(i => CreateVm(px, nodes[i % nodes.Count], isos[i % nodes.Count], vlanId, $"{envName}-worker-{i + 1}", $"worker-{i}", 610 + i, "worker", cores: 4, memory: 8192, diskSize: 80, $"{workerIps[i]}/{prefix}", gatewayIp))
+                .Select(i => CreateVm(px, nodes[i % nodes.Count], isos[i % nodes.Count], vlanId, $"{envName}-worker-{i + 1}", $"worker-{i}", 610 + i, "worker", cores: clusterOpts.WorkerCores, memory: clusterOpts.WorkerMemoryMb, diskSize: clusterOpts.WorkerDiskGb, $"{workerIps[i]}/{prefix}", gatewayIp))
                 .ToList();
 
             var clusterName = $"{envName}-cluster";
