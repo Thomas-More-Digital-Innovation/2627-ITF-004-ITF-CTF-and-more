@@ -21,10 +21,16 @@ spec:
     key: password
   database: ctfd
 
-  # Pinned to the 11.8 LTS line. MariaDB 12.x auto-names foreign keys "1", "2", ... instead of
-  # "<table>_ibfk_N", and CTFd's Alembic migrations drop FKs by those hard-coded names
-  # (e.g. awards_ibfk_1), so CTFd crash-loops on 12.x. Do not bump to 12.x without checking that.
-  image: mariadb:11.8.9
+  # Pinned to the 10.11 LTS line, the version CTFd itself ships with (CTFd's docker-compose.yml).
+  # Do not bump without checking:
+  #   - 11.6.2+ turns innodb_snapshot_isolation ON by default: concurrent updates of the same row
+  #     fail with error 1020 "Record has changed since last read", and CTFd answers 500 (its Tracking
+  #     table races on every API request; CTFd PRs #3084/#3152, unmerged).
+  #   - 12.x auto-names foreign keys "1", "2", ... instead of "<table>_ibfk_N", and CTFd's Alembic
+  #     migrations drop FKs by those hard-coded names (e.g. awards_ibfk_1), so CTFd crash-loops.
+  # Downgrading an existing datadir is not supported by MariaDB: changing the major version here
+  # requires recreating the database (its PVCs).
+  image: mariadb:10.11.19
 
   replicas: 3
   galera:
