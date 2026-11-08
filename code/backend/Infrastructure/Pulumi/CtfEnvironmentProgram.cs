@@ -48,7 +48,7 @@ namespace Infrastructure.Pulumi
         public const string SectionName = "CtfCluster";
 
         public string CiliumVersion { get; set; } = "1.20.4";
-        public string ArgoCdVersion { get; set; } = "7.8.2";
+        public string ArgoCdVersion { get; set; } = "10.15.0";
         public string ChallengesRepoUrl { get; set; } = "https://gitlab.com/it-factory-thomas-more/SKIL3/25-26/bsides-ctf/challenges.git";
         public string? GitlabUsername { get; set; }
         public string? GitlabToken { get; set; }
