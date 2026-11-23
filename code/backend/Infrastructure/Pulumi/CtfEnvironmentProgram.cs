@@ -41,6 +41,14 @@ namespace Infrastructure.Pulumi
         public string VnetName { get; set; } = "envs";
         public string DatastoreId { get; set; } = "sas-disks";
         public string[] Tags { get; set; } = ["pulumi"];
+
+        /// <summary>
+        /// SSH access to the Proxmox nodes. The provider needs it to upload cloud-init snippets and
+        /// disk images (kali-lab). SshPassword falls back to Password, like terraform/management.
+        /// </summary>
+        public string SshUsername { get; set; } = "root";
+        public string? SshPassword { get; set; }
+        public bool SshAgent { get; set; } = false;
     }
 
     public class CtfClusterOptions

@@ -18,11 +18,15 @@ namespace Infrastructure.Services
         private const string Rfc1918AliasName = "RFC1918_Networks";
         private const string Prefix = "cyberkit_";
 
+        // OPNsense only accepts [A-Za-z0-9_] in interface descriptions; environment names use "-".
+        private static string Descr(string environmentName) =>
+            Prefix + System.Text.RegularExpressions.Regex.Replace(environmentName.ToLowerInvariant(), "[^a-z0-9_]", "_");
+
         private string ParentInterface => options.Value.ParentInterface;
 
         public async Task ConfigureEnvironmentNetworkAsync(int vlanId, string cidr, string environmentName, CancellationToken ct = default)
         {
-            var descr = $"{Prefix}{environmentName}";
+            var descr = Descr(environmentName);
 
             var device = await EnsureVlanAsync(vlanId, descr, ct);
             var identifier = await EnsureAssignmentAsync(device, descr, cidr, ct);
@@ -32,7 +36,7 @@ namespace Infrastructure.Services
 
         public async Task RemoveEnvironmentNetworkAsync(int vlanId, string environmentName, CancellationToken ct = default)
         {
-            var descr = $"{Prefix}{environmentName}";
+            var descr = Descr(environmentName);
 
             // 1. Firewall rule (references the interface, so it goes first)
             var rules = await SearchAsync("firewall/filter/searchRule", ct);
