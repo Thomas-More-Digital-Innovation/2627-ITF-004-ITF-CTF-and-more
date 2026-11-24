@@ -52,6 +52,12 @@ class Challenge:
     port: int = 80
     protocol: str = "http"
     command: list[str] | None = None
+    dynamic_flag: bool = False
+    flag_prefix: str = ""
+    flag_env: str = "FLAG"
+    timeout: int = 900
+    shared: bool = False
+    destroy_on_flag: bool = True
     # filled in at runtime
     meta: dict = field(default_factory=dict)
     name: str = ""
@@ -212,6 +218,10 @@ def register(api: CtfdApi, c: Challenge, existing: dict | None) -> None:
                   "host": env("CHALLENGE_HOST")}
     if c.command:
         additional["command"] = json.dumps(c.command)
+    if c.dynamic_flag:
+        additional["dynamic_flag"] = "true"
+        additional["flag_prefix"] = c.flag_prefix or c.slug.replace("-", "_")
+        additional["flag_env"] = c.flag_env or "FLAG"
     value = int(meta.get("value", 100))
     payload = {
         "name": c.name,
@@ -222,9 +232,9 @@ def register(api: CtfdApi, c: Challenge, existing: dict | None) -> None:
         "state": meta.get("state", "visible"),
         "type": "dynamic_iac",
         "scenario": "localhost:5000/scenarios/k8s-monopod:latest",
-        "timeout": 900,
-        "destroy_on_flag": True,
-        "shared": False,
+        "timeout": int(c.timeout),
+        "destroy_on_flag": bool(c.destroy_on_flag),
+        "shared": bool(c.shared),
         "mana_cost": 0,
         "additional": json.dumps(additional),
     }
@@ -246,10 +256,11 @@ def register(api: CtfdApi, c: Challenge, existing: dict | None) -> None:
     cid = api.post("/challenges", json=payload)["id"]
     log(f"[+] Created '{c.name}' (id={cid}) -> {c.image}")
 
-    for fl in meta.get("flags") or []:
-        fl = {"content": fl} if isinstance(fl, str) else fl
-        api.post("/flags", json={"challenge_id": cid, "type": fl.get("type", "static"),
-                                 "content": fl.get("content", ""), "data": fl.get("data", "")})
+    if not c.dynamic_flag:
+        for fl in meta.get("flags") or []:
+            fl = {"content": fl} if isinstance(fl, str) else fl
+            api.post("/flags", json={"challenge_id": cid, "type": fl.get("type", "static"),
+                                     "content": fl.get("content", ""), "data": fl.get("data", "")})
     for tg in meta.get("tags") or []:
         api.post("/tags", json={"challenge_id": cid,
                                 "value": tg.get("value") if isinstance(tg, dict) else str(tg)})

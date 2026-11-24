@@ -99,13 +99,16 @@ data:
 
     import (
     	"bytes"
+    	"crypto/sha256"
     	"crypto/tls"
+    	"encoding/hex"
     	"encoding/json"
     	"fmt"
     	"io"
     	"net/http"
     	"os"
     	"strconv"
+    	"strings"
     	"time"
 
     	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
@@ -161,6 +164,9 @@ data:
 
     		if ctx.DryRun() {
     			ctx.Export("connection_info", pulumi.String("http://preview.ctf.local"))
+    			if strings.EqualFold(add["dynamic_flag"], "true") {
+    				ctx.Export("flags", pulumi.StringArray{pulumi.String("CTF{preview}")})
+    			}
     			return nil
     		}
 
@@ -181,6 +187,24 @@ data:
     			proto = "http"
     		}
 
+    		// Per-instance dynamic flag: derived deterministically from the instance's
+    		// opaque identity so it is unique per player/instance and stable across refreshes.
+    		dynamicFlag := ""
+    		flagEnv := add["flag_env"]
+    		if flagEnv == "" {
+    			flagEnv = "FLAG"
+    		}
+    		if strings.EqualFold(add["dynamic_flag"], "true") {
+    			prefix := strings.TrimSpace(add["flag_prefix"])
+    			sum := sha256.Sum256([]byte(os.Getenv("FLAG_SECRET") + ":" + id + ":" + image + ":" + prefix))
+    			token := hex.EncodeToString(sum[:])[:12]
+    			if prefix != "" {
+    				dynamicFlag = fmt.Sprintf("CTF{%s_%s}", prefix, token)
+    			} else {
+    				dynamicFlag = fmt.Sprintf("CTF{%s}", token)
+    			}
+    		}
+
     		container := map[string]any{
     			"name":            "chall",
     			"image":           image,
@@ -198,6 +222,11 @@ data:
     				"requests": map[string]any{"cpu": "50m", "memory": "64Mi"},
     				"limits":   map[string]any{"cpu": "500m", "memory": "512Mi", "ephemeral-storage": "1Gi"},
     			},
+    		}
+    		if dynamicFlag != "" {
+    			container["env"] = []map[string]any{
+    				{"name": flagEnv, "value": dynamicFlag},
+    			}
     		}
     		if cmdStr := add["command"]; cmdStr != "" {
     			var cmdSlice []string
@@ -286,6 +315,9 @@ data:
     			conn = fmt.Sprintf("nc %s %d", host, np)
     		}
     		ctx.Export("connection_info", pulumi.String(conn))
+    		if dynamicFlag != "" {
+    			ctx.Export("flags", pulumi.StringArray{pulumi.String(dynamicFlag)})
+    		}
     		return nil
     	})
     }
