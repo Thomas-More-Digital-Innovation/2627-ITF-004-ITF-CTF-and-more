@@ -440,6 +440,8 @@ spec:
       app.kubernetes.io/name: chall-manager
   template:
     metadata:
+      annotations:
+        ctf.dock/scenario-version: "2"
       labels:
         app.kubernetes.io/name: chall-manager
         app.kubernetes.io/part-of: ctf-instancer

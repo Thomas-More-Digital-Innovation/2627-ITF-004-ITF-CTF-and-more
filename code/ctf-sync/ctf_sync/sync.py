@@ -1,14 +1,17 @@
-"""Challenge sync: GitLab challenges repo -> in-cluster image builds -> CTFd.
+"""Challenge sync: GitLab ctf-challenges repo -> in-cluster image builds -> CTFd.
 
 Each run:
   1. `git ls-remote` the challenges repo; exit early if the commit equals the last fully
      synced one (stored on the repo PVC). FORCE_SYNC=true skips this check.
   2. Fetch the repo into the PVC (incremental, shallow).
-  3. ctfcli install/sync the static challenges whose directory changed (git tree hash).
-  4. For every containerized challenge, compute a content tag from the git tree hash of its
-     build context; build + push only tags that are missing from the local registry, via the
-     shared buildkitd.
-  5. Register / update each containerized challenge as `dynamic_iac` pointing at its exact tag.
+  3. Read `active.yaml` from the repo root. Each listed challenge directory is classified by
+     its `challenge.yml`:
+       - no `deploy:` block -> static challenge (synced via `ctfcli`)
+       - has `deploy:` block -> containerized challenge (built via buildkitd, registered as
+         `dynamic_iac` in CTFd / chall-manager)
+  4. Sync changed static challenges (tracked by git tree hash).
+  5. Build + push missing container images (content-addressed tags) and register/update each
+     containerized challenge as `dynamic_iac`.
 
 The last synced commit is only recorded when everything succeeded, so failures retry on the
 next run.
@@ -32,7 +35,7 @@ from .common import CtfdApi, env, log, wait_for_ctfd
 
 REPO_DIR = Path(env("REPO_DIR", "/data/repo"))
 STATE_FILE = Path(env("STATE_FILE", "/data/last-synced-commit"))
-CHALLENGES_FILE = Path(env("DYNAMIC_CHALLENGES_FILE", "/config/dynamic-challenges.yaml"))
+ACTIVE_MANIFEST = env("ACTIVE_MANIFEST", "active.yaml")
 
 IMAGE_PREFIX = env("IMAGE_PREFIX", "registry.ctf-build.svc.cluster.local/challenges")
 REGISTRY_API = env("REGISTRY_API", "http://registry.ctf-build.svc.cluster.local").rstrip("/")
@@ -41,13 +44,12 @@ BUILD_CONCURRENCY = int(env("BUILD_CONCURRENCY", "4"))
 STATIC_CONCURRENCY = int(env("STATIC_CONCURRENCY", "4"))
 # Per-directory git tree hashes of static challenges that were synced successfully.
 STATIC_STATE = Path(env("STATIC_STATE_FILE", "/data/static-challenges.json"))
-TEAM_GLOB = env("TEAM_GLOB", "Team *")
 
 
 @dataclass
 class Challenge:
     path: str
-    context: str = "."
+    context: str = "src"
     dockerfile: str = "Dockerfile"
     port: int = 80
     protocol: str = "http"
@@ -115,29 +117,46 @@ def update_checkout(repo_url: str, branch: str) -> str:
 
 # --------------------------------------------------------------------------- challenges
 
-def load_challenges() -> list[Challenge]:
-    raw = yaml.safe_load(CHALLENGES_FILE.read_text()) or []
-    out = []
-    for entry in raw:
-        c = Challenge(**entry)
-        yml = c.dir / "challenge.yml"
-        if not yml.exists():
+def load_active_challenges() -> tuple[list[str], list[Challenge]]:
+    """Read active.yaml and split active challenges into (static_dirs, dynamic_challenges)."""
+    manifest_path = REPO_DIR / ACTIVE_MANIFEST
+    if not manifest_path.is_file():
+        sys.exit(f"[!] Missing {ACTIVE_MANIFEST} at repository root")
+
+    manifest = yaml.safe_load(manifest_path.read_text()) or {}
+    entries = manifest.get("challenges") or []
+
+    static_dirs: list[str] = []
+    dynamic: list[Challenge] = []
+
+    for entry in entries:
+        rel_path = entry.strip("/") if isinstance(entry, str) else str(entry.get("path", "")).strip("/")
+        if not rel_path:
+            continue
+        yml = REPO_DIR / rel_path / "challenge.yml"
+        if not yml.is_file():
             log(f"[!] Missing {yml}, skipping")
             continue
-        c.meta = yaml.safe_load(yml.read_text())
-        # A `deploy:` block in challenge.yml overrides the central list, so challenge authors
-        # can own their own settings.
-        for k, v in (c.meta.get("deploy") or {}).items():
+
+        meta = yaml.safe_load(yml.read_text()) or {}
+        deploy = meta.get("deploy")
+        if not deploy:
+            static_dirs.append(rel_path)
+            continue
+
+        c = Challenge(path=rel_path, meta=meta)
+        for k, v in deploy.items():
             if hasattr(c, k):
                 setattr(c, k, v)
-        c.name = c.meta["name"]
-        c.slug = re.sub(r"[^a-z0-9]+", "-", c.name.lower()).strip("-")
-        flags = c.meta.get("flags") or []
-        if flags:
+        c.name = meta["name"]
+        c.slug = re.sub(r"[^a-z0-9]+", "-", Path(rel_path).name.lower()).strip("-")
+        flags = meta.get("flags") or []
+        if flags and not c.dynamic_flag:
             c.flag = flags[0] if isinstance(flags[0], str) else flags[0].get("content", "")
         c.image = f"{IMAGE_PREFIX}/{c.slug}:{content_tag(c)}"
-        out.append(c)
-    return out
+        dynamic.append(c)
+
+    return sorted(set(static_dirs)), dynamic
 
 
 def content_tag(c: Challenge) -> str:
@@ -166,7 +185,7 @@ def build(c: Challenge) -> tuple[Challenge, bool, str]:
     ctx = c.context_dir
     tmp = None
     try:
-        # Some Dockerfiles COPY a flag.txt that isn't committed; inject it from challenge.yml.
+        # Backwards-compat: if a Dockerfile COPYs flag.txt that isn't committed, inject it.
         df = ctx / c.dockerfile
         if c.flag and not (ctx / "flag.txt").exists() and "flag.txt" in df.read_text(errors="ignore"):
             tmp = Path(tempfile.mkdtemp(prefix=f"ctx-{c.slug}-"))
@@ -278,26 +297,7 @@ def register(api: CtfdApi, c: Challenge, existing: dict | None) -> None:
                          data={"challenge_id": cid, "type": "challenge"})
 
 
-def find_static_dirs(dynamic: list[Challenge]) -> list[str]:
-    """Challenge dirs (relative to the repo) under the team folders, minus the containerized ones.
-
-    Same discovery as the repo's ctfd-cli-autorun_all_teams.py, but the containerized challenges
-    are left out: ctfcli would sync them back to `standard`, after which register() would
-    delete + recreate them as dynamic_iac and wipe their solves.
-    """
-    skip = {c.path for c in dynamic}
-    dirs = []
-    for team in sorted(REPO_DIR.glob(TEAM_GLOB)):
-        for yml in team.rglob("challenge.yml"):
-            if {"venv", ".venv", "__pycache__", ".git", "node_modules"} & set(yml.parts):
-                continue
-            rel = yml.parent.relative_to(REPO_DIR).as_posix()
-            if rel not in skip:
-                dirs.append(rel)
-    return sorted(dirs)
-
-
-def import_static(api: CtfdApi, dynamic: list[Challenge], force: bool) -> list[str]:
+def import_static(api: CtfdApi, static_dirs: list[str], force: bool) -> list[str]:
     """ctfcli install/sync for static challenges whose directory changed. Returns failed dirs."""
     ctf_dir = REPO_DIR / ".ctf"
     ctf_dir.mkdir(exist_ok=True)
@@ -306,8 +306,7 @@ def import_static(api: CtfdApi, dynamic: list[Challenge], force: bool) -> list[s
     )
 
     state = {} if force or not STATIC_STATE.exists() else json.loads(STATIC_STATE.read_text())
-    trees = {d: git("rev-parse", f"HEAD:{d}", cwd=REPO_DIR, capture=True)
-             for d in find_static_dirs(dynamic)}
+    trees = {d: git("rev-parse", f"HEAD:{d}", cwd=REPO_DIR, capture=True) for d in static_dirs}
     changed = [d for d, t in trees.items() if state.get(d) != t]
     log(f"[*] Static challenges: {len(trees)} total, {len(changed)} changed")
     if not changed:
@@ -366,13 +365,15 @@ def main() -> None:
     commit = update_checkout(repo_url, branch)
     log(f"[*] Syncing {branch or 'HEAD'}@{commit[:10]} (previous: {last[:10] or 'none'})")
 
-    challenges = load_challenges()
-    failed = import_static(api, challenges, force)
+    static_dirs, dynamic = load_active_challenges()
+    log(f"[*] Active manifest: {len(static_dirs)} static, {len(dynamic)} containerized")
 
-    ready = build_missing(challenges)
+    failed = import_static(api, static_dirs, force)
+
+    ready = build_missing(dynamic)
 
     existing = {c["name"]: c for c in api.get("/challenges?view=admin")}
-    failed += [c.name for c in challenges if c not in ready]
+    failed += [c.name for c in dynamic if c not in ready]
     for c in ready:
         try:
             register(api, c, existing.get(c.name))

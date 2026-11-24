@@ -81,33 +81,6 @@ spec:
     requests:
       storage: 5Gi
 ---
-# Which challenges are containerized, and how to run them. A `deploy:` block with the same
-# keys inside a challenge's challenge.yml overrides its entry here.
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: ctf-sync-challenges
-  namespace: ctf
-data:
-  dynamic-challenges.yaml: |
-    - { path: "Team A1/The-13th-Cabin", port: 5000 }
-    - { path: "Team A1/camp-forest-green-found-footage", context: web, port: 5000 }
-    - { path: "Team A1/crystal_lake", port: 80 }
-    - { path: "Team A1/devils-jackpot", port: 5000 }
-    - { path: "Team A1/flappy bird", port: 80 }
-    - { path: "Team A1/linux-jail-escape", context: jail, port: 80, command: ["/usr/local/bin/ttyd", "-p", "80", "su", "-", "prisoner"] }
-    - { path: "Team A1/path-traversal-challenge", port: 3000 }
-    - { path: "Team A1/physical_puzzle", port: 80 }
-    - { path: "Team A1/spectral-challenge", context: web, port: 5000 }
-    - { path: "Team A1/whitespace-challenge", context: web, port: 80 }
-    - { path: "Team A2/windows master quest", port: 5000 }
-    - { path: "Team A3/Misc_Character_Guessing", context: assets, port: 3000 }
-    - { path: "Team A3/PWN_Priv_Escalation_Part-1", context: assets, port: 22, protocol: ssh }
-    - { path: "Team A3/PWN_Priv_Escalation_Part-2", context: assets, port: 22, protocol: ssh }
-    - { path: "Team A3/Web_Client_Auth", context: assets, port: 80 }
-    - { path: "Team A3/Web_Command_Injection", context: assets, port: 5000 }
-    - { path: "Team A3/Web_Redirecting", context: assets, port: 3000 }
----
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -153,9 +126,6 @@ spec:
                 limits: { memory: 1Gi }
               volumeMounts:
                 - { name: data, mountPath: /data }
-                - { name: challenges, mountPath: /config }
           volumes:
             - name: data
               persistentVolumeClaim: { claimName: ctf-sync-repo }
-            - name: challenges
-              configMap: { name: ctf-sync-challenges }
