@@ -89,8 +89,11 @@ def git_auth_args() -> list[str]:
 
 
 def git(*args: str, cwd: Path | None = None, capture: bool = False) -> str:
-    r = subprocess.run(["git", *git_auth_args(), *args], cwd=cwd, check=True, text=True,
-                       capture_output=capture)
+    r = subprocess.run(["git", *git_auth_args(), *args], cwd=cwd, text=True,
+                       capture_output=True)
+    if r.returncode != 0:
+        msg = (r.stderr or r.stdout).strip()
+        raise RuntimeError(f"git {' '.join(args)} failed (exit {r.returncode}): {msg}")
     return r.stdout.strip() if capture else ""
 
 
@@ -103,14 +106,22 @@ def remote_head(repo_url: str, branch: str) -> str:
 
 
 def update_checkout(repo_url: str, branch: str) -> str:
+    same_repo = False
     if (REPO_DIR / ".git").is_dir():
-        git("remote", "set-url", "origin", repo_url, cwd=REPO_DIR)
+        try:
+            same_repo = git("remote", "get-url", "origin", cwd=REPO_DIR, capture=True) == repo_url
+        except RuntimeError:
+            same_repo = False
+
+    if same_repo:
         git("fetch", "--depth=1", "origin", branch or "HEAD", cwd=REPO_DIR)
         git("reset", "--hard", "FETCH_HEAD", cwd=REPO_DIR)
         git("clean", "-ffdx", cwd=REPO_DIR)
     else:
         if REPO_DIR.exists():
             shutil.rmtree(REPO_DIR)
+        if STATIC_STATE.exists():
+            STATIC_STATE.unlink()
         git("clone", "--depth=1", *(["--branch", branch] if branch else []), repo_url, str(REPO_DIR))
     return git("rev-parse", "HEAD", cwd=REPO_DIR, capture=True)
 
