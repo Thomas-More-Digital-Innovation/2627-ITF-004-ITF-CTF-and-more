@@ -1,7 +1,7 @@
 # Challenge sync pipeline. Source: code/ctf-sync/
 #
 #   ctf-sync-image  (hook, every ArgoCD sync)  builds code/ctf-sync (main) from GitHub on the shared
-#                   buildkitd and pushes registry.ctf-build.svc.cluster.local/ctf/ctf-sync:v2
+#                   buildkitd and pushes registry.ctf-build.svc.cluster.local/ctf/ctf-sync:v3
 #                   (bump the tag whenever code/ctf-sync/ changes so ArgoCD rebuilds and Spegel
 #                   never serves a stale mutable :latest tag from peer nodes)
 #   ctfd-bootstrap  (hook, every ArgoCD sync)  CTFd /setup, admin token -> Secret ctfd-admin-token,
@@ -40,7 +40,7 @@ spec:
             - --opt
             - context=https://github.com/Thomas-More-Digital-Innovation/2627-ITF-004-ITF-CTF-and-more.git#main:code/ctf-sync
             - --output
-            - type=image,name=registry.ctf-build.svc.cluster.local/ctf/ctf-sync:v2,push=true
+            - type=image,name=registry.ctf-build.svc.cluster.local/ctf/ctf-sync:v3,push=true
             - --progress
             - plain
 ---
@@ -63,7 +63,7 @@ spec:
       restartPolicy: OnFailure
       containers:
         - name: bootstrap
-          image: registry.ctf-build.svc.cluster.local/ctf/ctf-sync:v2
+          image: registry.ctf-build.svc.cluster.local/ctf/ctf-sync:v3
           imagePullPolicy: Always
           args: ["ctf_sync.bootstrap"]
           envFrom:
@@ -109,7 +109,7 @@ spec:
           automountServiceAccountToken: false
           containers:
             - name: sync
-              image: registry.ctf-build.svc.cluster.local/ctf/ctf-sync:v2
+              image: registry.ctf-build.svc.cluster.local/ctf/ctf-sync:v3
               imagePullPolicy: Always
               args: ["ctf_sync.sync"]
               envFrom:

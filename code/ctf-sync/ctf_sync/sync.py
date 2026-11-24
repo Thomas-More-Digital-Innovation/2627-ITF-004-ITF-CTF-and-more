@@ -346,6 +346,21 @@ def import_static(api: CtfdApi, static_dirs: list[str], force: bool) -> list[str
     return failed
 
 
+def hide_inactive(api: CtfdApi, active_names: set[str]) -> list[str]:
+    """Hide any CTFd challenge not present in active.yaml (preserves solves if re-enabled)."""
+    failed: list[str] = []
+    for ch in api.get("/challenges?view=admin") or []:
+        name = ch.get("name", "")
+        if name not in active_names and ch.get("state") != "hidden":
+            try:
+                api.patch(f"/challenges/{ch['id']}", json={"state": "hidden"})
+                log(f"[-] Hid inactive challenge '{name}' (id={ch['id']})")
+            except RuntimeError as e:
+                log(f"[!] Hiding '{name}' (id={ch['id']}) failed: {e}")
+                failed.append(name)
+    return failed
+
+
 # --------------------------------------------------------------------------- main
 
 def main() -> None:
@@ -391,6 +406,13 @@ def main() -> None:
         except RuntimeError as e:
             log(f"[!] Registering '{c.name}' failed: {e}")
             failed.append(c.name)
+
+    active_names = {c.name for c in dynamic}
+    for d in static_dirs:
+        name = (yaml.safe_load((REPO_DIR / d / "challenge.yml").read_text()) or {}).get("name")
+        if name:
+            active_names.add(name)
+    failed += hide_inactive(api, active_names)
 
     if failed:
         sys.exit(f"[!] {len(failed)} challenge(s) failed: {', '.join(failed)}. Will retry next run.")
