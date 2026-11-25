@@ -82,23 +82,6 @@ spec:
           create: false
           mountPath: /var/ctfd
           existingPersistentVolumeClaim: ctfd-shared
-        # The previous ReadWriteOnce volume. Still declared so ArgoCD doesn't prune it (and its data)
-        # before code/k8s/migrations/ctfd-uploads-to-rwx.yaml has run. Remove this block afterwards;
-        # Prune=false then keeps the PVC until you delete it by hand.
-        extraObjects:
-          - apiVersion: v1
-            kind: PersistentVolumeClaim
-            metadata:
-              name: ctfd-storage
-              annotations:
-                argocd.argoproj.io/sync-options: Prune=false
-            spec:
-              accessModes: ["ReadWriteOnce"]
-              storageClassName: longhorn
-              volumeMode: Filesystem
-              resources:
-                requests:
-                  storage: 5Gi
         env:
           - name: TZ
             value: UTC
