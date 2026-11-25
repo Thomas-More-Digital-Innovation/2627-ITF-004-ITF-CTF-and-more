@@ -1,0 +1,38 @@
+# Caps on the untrusted challenge instances, so they can't starve the nodes.
+#
+# Sized for 6 workers (~47 CPU / ~66 GiB allocatable) and 200 concurrent instances at
+# 50m/64Mi requested and 500m/512Mi limit each (chall-manager.yaml). Limits are overcommitted.
+#
+# Deployments and Services are capped below pods on purpose: over a pod quota the Deployment is
+# still accepted and the player gets an address that never works, while a rejected Deployment makes
+# chall-manager fail the request and CTFd show an error.
+#
+# Related: per-player/team cap = INSTANCES_PER_SOURCE (challenges-sync.yaml); process limit =
+# kubelet podPidsLimit (CtfEnvironmentProgram.cs); lifetime = `timeout` in challenge.yml (900s).
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: challenge-quota
+  namespace: ctf-challenges
+spec:
+  hard:
+    count/deployments.apps: "200"
+    count/services: "210"
+    services.nodeports: "210"
+    pods: "220"
+    requests.cpu: "12"
+    requests.memory: 16Gi
+    limits.cpu: "110"
+    limits.memory: 110Gi
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: challenge-limits
+  namespace: ctf-challenges
+spec:
+  limits:
+    - type: Container
+      defaultRequest: { cpu: 50m, memory: 64Mi, ephemeral-storage: 128Mi }
+      default: { cpu: 500m, memory: 512Mi, ephemeral-storage: 1Gi }
+      max: { cpu: "1", memory: 1Gi, ephemeral-storage: 2Gi }

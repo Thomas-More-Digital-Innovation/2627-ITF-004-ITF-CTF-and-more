@@ -58,6 +58,7 @@ class Challenge:
     flag_prefix: str = ""
     flag_env: str = "FLAG"
     timeout: int = 900
+    mana_cost: int = 1  # counts towards the per-player/team cap (INSTANCES_PER_SOURCE)
     shared: bool = False
     destroy_on_flag: bool = True
     # filled in at runtime
@@ -265,7 +266,7 @@ def register(api: CtfdApi, c: Challenge, existing: dict | None) -> None:
         "timeout": int(c.timeout),
         "destroy_on_flag": bool(c.destroy_on_flag),
         "shared": bool(c.shared),
-        "mana_cost": 0,
+        "mana_cost": int(c.mana_cost),
         "additional": json.dumps(additional),
     }
 
@@ -310,6 +311,8 @@ def register(api: CtfdApi, c: Challenge, existing: dict | None) -> None:
 
 def import_static(api: CtfdApi, static_dirs: list[str], force: bool) -> list[str]:
     """ctfcli install/sync for static challenges whose directory changed. Returns failed dirs."""
+    # ctfcli initializes this directory in each worker; create it before parallel sync.
+    (REPO_DIR / "pages").mkdir(exist_ok=True)
     ctf_dir = REPO_DIR / ".ctf"
     ctf_dir.mkdir(exist_ok=True)
     (ctf_dir / "config").write_text(

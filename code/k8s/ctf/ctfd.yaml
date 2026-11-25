@@ -1,3 +1,19 @@
+# Shared by all CTFd replicas (Longhorn serves RWX volumes over NFS).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ctfd-shared
+  namespace: ctf
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+    argocd.argoproj.io/sync-options: Prune=false
+spec:
+  accessModes: ["ReadWriteMany"]
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 5Gi
+---
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
@@ -20,10 +36,27 @@ spec:
           repository: ctferio/ctfd
           tag: "3.8.6-0.10.1"
         controller:
-          replicas: 1
-          # Uploads live on a ReadWriteOnce volume: the old pod must release it before the new one starts.
+          # Stateless apart from the shared uploads volume: cache, sessions and locks live in Redis (redis.yaml).
+          replicas: 2
           updateStrategy:
-            type: Recreate
+            type: RollingUpdate
+            rollingUpdate:
+              maxUnavailable: 0
+              maxSurge: 1
+        # Spread the replicas over nodes, preferably over Proxmox hosts.
+        affinity:
+          podAntiAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                podAffinityTerm:
+                  topologyKey: topology.kubernetes.io/zone
+                  labelSelector:
+                    matchLabels: { app.kubernetes.io/name: ctfd }
+              - weight: 50
+                podAffinityTerm:
+                  topologyKey: kubernetes.io/hostname
+                  labelSelector:
+                    matchLabels: { app.kubernetes.io/name: ctfd }
         service:
           type: ClusterIP
         ports:
@@ -34,7 +67,7 @@ spec:
         # lives in the ctf-edge chart (code/k8s/ctf-edge), which the backend deploys with the domain.
         ingressRoute:
           create: false
-        # SECRET_KEY and DATABASE_URL come from the ctfd-secrets Secret created by the backend's
+        # SECRET_KEY, DATABASE_URL and REDIS_URL come from the ctfd-secrets Secret created by the backend's
         # Pulumi program. The values here are placeholders: the chart only uses the keys.
         secret:
           create: false
@@ -42,14 +75,30 @@ spec:
           values:
             SECRET_KEY: from-secret
             DATABASE_URL: from-secret
-        # Uploads and logs on Longhorn (the chart mounts <mountPath>/uploads and <mountPath>/logs
+            REDIS_URL: from-secret
+        # Uploads and logs on a shared Longhorn volume, ctfd-shared below (the chart mounts <mountPath>/uploads and <mountPath>/logs
         # and sets UPLOAD_FOLDER / LOG_FOLDER accordingly).
         persistentVolumeClaim:
-          create: true
+          create: false
           mountPath: /var/ctfd
-          accessMode: ReadWriteOnce
-          size: 5Gi
-          storageClassName: longhorn
+          existingPersistentVolumeClaim: ctfd-shared
+        # The previous ReadWriteOnce volume. Still declared so ArgoCD doesn't prune it (and its data)
+        # before code/k8s/migrations/ctfd-uploads-to-rwx.yaml has run. Remove this block afterwards;
+        # Prune=false then keeps the PVC until you delete it by hand.
+        extraObjects:
+          - apiVersion: v1
+            kind: PersistentVolumeClaim
+            metadata:
+              name: ctfd-storage
+              annotations:
+                argocd.argoproj.io/sync-options: Prune=false
+            spec:
+              accessModes: ["ReadWriteOnce"]
+              storageClassName: longhorn
+              volumeMode: Filesystem
+              resources:
+                requests:
+                  storage: 5Gi
         env:
           - name: TZ
             value: UTC
@@ -58,6 +107,42 @@ spec:
           - name: PLUGIN_SETTINGS_CM_API_URL
             value: http://chall-manager.ctf.svc.cluster.local:8080
         extraInitContainers:
+          # Two pods migrating an empty database at once would corrupt it: run the migrations under a
+          # Redis lock first, so the main container's own `flask db upgrade` is a no-op.
+          db-migrate:
+            image: docker.io/ctferio/ctfd:3.8.6-0.10.1
+            workingDir: /opt/CTFd
+            command:
+              - python3
+              - -c
+              - |
+                import os, subprocess, time
+                import redis
+                r = redis.Redis.from_url(os.environ["REDIS_URL"])
+                while True:
+                    try:
+                        r.ping()
+                        break
+                    except (redis.ConnectionError, redis.TimeoutError) as e:
+                        print("Waiting for Redis:", e, flush=True)
+                        time.sleep(2)
+                with r.lock("ctfd-db-migrate", timeout=600):
+                    subprocess.run(["python", "ping.py"], check=True)
+                    subprocess.run(["flask", "db", "upgrade"], check=True)
+            env:
+              - name: LOG_FOLDER
+                value: /tmp
+              - name: PLUGIN_SETTINGS_CM_API_URL
+                value: http://chall-manager.ctf.svc.cluster.local:8080
+              - name: SECRET_KEY
+                valueFrom:
+                  secretKeyRef: { name: ctfd-secrets, key: SECRET_KEY }
+              - name: DATABASE_URL
+                valueFrom:
+                  secretKeyRef: { name: ctfd-secrets, key: DATABASE_URL }
+              - name: REDIS_URL
+                valueFrom:
+                  secretKeyRef: { name: ctfd-secrets, key: REDIS_URL }
           theme-sync:
             image: alpine/git:v2.45.2
             env:

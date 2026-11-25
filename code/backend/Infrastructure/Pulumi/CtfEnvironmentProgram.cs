@@ -158,6 +158,8 @@ namespace Infrastructure.Pulumi
         //   registry.ctf-build.svc.cluster.local -> :30500 in-cluster registry (our images)
         //   docker.io                            -> :30501 registry-cache (Docker Hub pull-through)
         // If a NodePort isn't up yet (fresh cluster), containerd falls through to the next host.
+        // podPidsLimit: caps processes per pod, so a fork bomb in a challenge can't exhaust a node. Kubernetes has
+        // no per-pod setting; 4096 leaves room for thread-heavy pods (Longhorn, MariaDB, buildkitd).
         // nodeLabels: topology.kubernetes.io/zone = Proxmox host, so Longhorn places replicas (and the
         // scheduler spreads pods) across physical machines rather than just across VMs.
         private static string BuildNodePatch(string ipWithPrefix, string gatewayIp, string schematicId, string proxmoxNode) =>
@@ -183,6 +185,7 @@ namespace Infrastructure.Pulumi
                   }
                 },
                 "kubelet": {
+                  "extraConfig": { "podPidsLimit": 4096 },
                   "extraMounts": [
                     {
                       "destination": "/var/lib/longhorn",
@@ -473,6 +476,7 @@ return hs
             // stay stable across `pulumi up` runs (a new value would lock CTFd out of MariaDB).
             var dbRootPassword = new RandomPassword("ctfd-db-root-password", new RandomPasswordArgs { Length = 32, Special = false });
             var dbPassword = new RandomPassword("ctfd-db-password", new RandomPasswordArgs { Length = 32, Special = false });
+            var redisPassword = new RandomPassword("ctfd-redis-password", new RandomPasswordArgs { Length = 32, Special = false });
             var ctfdSecretKey = new RandomPassword("ctfd-secret-key", new RandomPasswordArgs { Length = 64, Special = false });
 
             // Consumed by the MariaDB custom resource in code/k8s/ctf/ctfd-db.yaml.
@@ -486,6 +490,13 @@ return hs
                 },
             }, new CustomResourceOptions { Provider = k8sProvider, DependsOn = { ctfNamespace } });
 
+            // Consumed by the Redis StatefulSet in code/k8s/ctf/redis.yaml.
+            _ = new K8s.Core.V1.Secret("ctfd-redis", new K8s.Types.Inputs.Core.V1.SecretArgs
+            {
+                Metadata = new ObjectMetaArgs { Name = "ctfd-redis", Namespace = "ctf" },
+                StringData = { ["password"] = redisPassword.Result },
+            }, new CustomResourceOptions { Provider = k8sProvider, DependsOn = { ctfNamespace } });
+
             // Consumed by the CTFd chart via secret.existingSecret. ctfd-db-primary is the Service
             // mariadb-operator creates that always points at the Galera node currently taking writes.
             _ = new K8s.Core.V1.Secret("ctfd-secrets", new K8s.Types.Inputs.Core.V1.SecretArgs
@@ -496,6 +507,8 @@ return hs
                     ["SECRET_KEY"] = ctfdSecretKey.Result,
                     ["DATABASE_URL"] = dbPassword.Result.Apply(pw =>
                         $"mysql+pymysql://ctfd:{pw}@ctfd-db-primary.ctf.svc.cluster.local:3306/ctfd"),
+                    ["REDIS_URL"] = redisPassword.Result.Apply(pw =>
+                        $"redis://:{pw}@redis.ctf.svc.cluster.local:6379/0"),
                 },
             }, new CustomResourceOptions { Provider = k8sProvider, DependsOn = { ctfNamespace } });
 

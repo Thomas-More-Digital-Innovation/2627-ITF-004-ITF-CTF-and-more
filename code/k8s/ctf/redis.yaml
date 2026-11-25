@@ -1,0 +1,107 @@
+# Redis for CTFd: cache, login sessions and the chall-manager plugin's per-player locks, shared by
+# all CTFd replicas. Persisted (AOF) so that a Redis restart doesn't log every player out.
+# The password comes from the ctfd-redis Secret, created by the backend's Pulumi program.
+#
+# If a CTFd pod is killed while it is starting an instance, that player's lock can stay behind and
+# they keep getting "instance creation already in progress". Delete the key (<user or team id>_gr):
+#   kubectl -n ctf exec redis-0 -- sh -c 'REDISCLI_AUTH=$REDIS_PASSWORD redis-cli DEL 42_gr'
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: ctf
+spec:
+  # Headless also keeps Kubernetes from injecting REDIS_PORT=tcp://... into CTFd, which reads REDIS_PORT.
+  clusterIP: None
+  selector: { app.kubernetes.io/name: redis }
+  ports:
+    - { name: redis, port: 6379, targetPort: redis }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: ctf
+  labels: { app.kubernetes.io/name: redis }
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  serviceName: redis
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: redis }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: redis }
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: redis
+          image: redis:7.4-alpine
+          command: ["redis-server"]
+          args:
+            - --requirepass
+            - $(REDIS_PASSWORD)
+            - --appendonly
+            - "yes"
+            - --appendfsync
+            - everysec
+            - --maxmemory
+            - 384mb
+            # Only evict keys with a TTL: the plugin's locks have none and must never be evicted.
+            - --maxmemory-policy
+            - volatile-lru
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: ctfd-redis, key: password }
+          ports:
+            - { name: redis, containerPort: 6379 }
+          readinessProbe:
+            exec: { command: ["sh", "-c", "REDISCLI_AUTH=$REDIS_PASSWORD redis-cli ping | grep -q PONG"] }
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            tcpSocket: { port: redis }
+            initialDelaySeconds: 20
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 768Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: longhorn
+        resources:
+          requests:
+            storage: 1Gi
+---
+# Sessions in Redis are pickled, so write access to Redis means code execution in CTFd.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-ingress
+  namespace: ctf
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: redis }
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: ctfd }
+      ports:
+        - { protocol: TCP, port: 6379 }

@@ -3,7 +3,7 @@
 1. Completes CTFd's /setup wizard if it hasn't run yet.
 2. Ensures the Secret `ctfd-admin-token` holds a valid admin API token (minted inside the
    CTFd pod, since a fresh CTFd has no token yet).
-3. Sets the active theme.
+3. Sets the active theme and the per-player/team instance cap.
 
 Idempotent: a valid existing token is reused.
 """
@@ -104,8 +104,14 @@ def main() -> None:
         store_token(token)
         log(f"[+] Minted new admin token into Secret {TOKEN_SECRET}.")
 
-    CtfdApi(ctfd_url, token).patch("/configs", json={"ctf_theme": THEME})
-    log(f"[*] Active theme set to {THEME}.")
+    # Mana is the plugin's instance budget; every challenge costs 1 unless it sets `mana_cost`.
+    # The plugin only reads its env variable on first setup, hence the explicit config.
+    mana = env("INSTANCES_PER_SOURCE", "3")
+    CtfdApi(ctfd_url, token).patch("/configs", json={
+        "ctf_theme": THEME,
+        "chall-manager:chall-manager_mana_total": mana,
+    })
+    log(f"[*] Active theme set to {THEME}, at most {mana} mana of instances per player/team.")
 
 
 if __name__ == "__main__":
