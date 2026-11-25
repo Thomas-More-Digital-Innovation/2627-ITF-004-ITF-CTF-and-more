@@ -1,10 +1,19 @@
-# Redis for CTFd: cache, login sessions and the chall-manager plugin's per-player locks, shared by
-# all CTFd replicas. Persisted (AOF) so that a Redis restart doesn't log every player out.
+# Highly available Redis for CTFd: cache, login sessions and the chall-manager plugin's per-player
+# locks, shared by all CTFd replicas.
+#
+#   redis-node     3 pods, each Redis + Sentinel. One master, two replicas; Sentinel (quorum 2)
+#                  promotes a replica when the master is lost.
+#   redis-haproxy  2 pods that forward redis:6379 to whichever node is master. CTFd only supports a
+#                  plain REDIS_URL, not Sentinel.
+#
+# Survives losing any one pod/node. Promoting a new master needs a majority (2 of 3 Sentinels).
 # The password comes from the ctfd-redis Secret, created by the backend's Pulumi program.
 #
 # If a CTFd pod is killed while it is starting an instance, that player's lock can stay behind and
 # they keep getting "instance creation already in progress". Delete the key (<user or team id>_gr):
-#   kubectl -n ctf exec redis-0 -- sh -c 'REDISCLI_AUTH=$REDIS_PASSWORD redis-cli DEL 42_gr'
+#   kubectl -n ctf exec redis-node-0 -c redis -- sh -c 'redis-cli -h redis DEL 42_gr'
+# Which node is master:
+#   kubectl -n ctf exec redis-node-0 -c sentinel -- redis-cli -p 26379 sentinel get-master-addr-by-name ctfd
 apiVersion: v1
 kind: Service
 metadata:
@@ -13,81 +22,338 @@ metadata:
 spec:
   # Headless also keeps Kubernetes from injecting REDIS_PORT=tcp://... into CTFd, which reads REDIS_PORT.
   clusterIP: None
-  selector: { app.kubernetes.io/name: redis }
+  selector: { app.kubernetes.io/name: redis-haproxy }
   ports:
     - { name: redis, port: 6379, targetPort: redis }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-node
+  namespace: ctf
+spec:
+  clusterIP: None
+  # The nodes must find each other before they are ready.
+  publishNotReadyAddresses: true
+  selector: { app.kubernetes.io/name: redis-node }
+  ports:
+    - { name: redis, port: 6379, targetPort: redis }
+    - { name: sentinel, port: 26379, targetPort: sentinel }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-node
+  namespace: ctf
+data:
+  init.sh: |
+    set -eu
+    domain="redis-node.$POD_NAMESPACE.svc.cluster.local"
+    me="$POD_NAME.$domain"
+
+    # Current master: ask the running Sentinels, else what our own Sentinel last knew, else node 0
+    # (only on the very first start).
+    master=""
+    for i in 0 1 2; do
+      master=$(timeout 3 redis-cli -h "redis-node-$i.$domain" -p 26379 --raw \
+        sentinel get-master-addr-by-name ctfd 2>/dev/null | head -n1 || true)
+      case "$master" in redis-node-*) break ;; *) master="" ;; esac
+    done
+    if [ -z "$master" ] && [ -f /data/sentinel.conf ]; then
+      master=$(awk '$1=="sentinel" && $2=="monitor" {print $4}' /data/sentinel.conf | tr -d '"')
+    fi
+    [ -n "$master" ] || master="redis-node-0.$domain"
+    echo "I am $me, master is $master"
+
+    umask 077
+    # Rewritten on every start; Sentinel reconfigures Redis afterwards.
+    cat > /data/redis.conf <<EOF
+    port 6379
+    dir /data
+    requirepass $REDISCLI_AUTH
+    masterauth $REDISCLI_AUTH
+    appendonly yes
+    appendfsync everysec
+    maxmemory 384mb
+    # Only evict keys with a TTL: the plugin's locks have none and must never be evicted.
+    maxmemory-policy volatile-lru
+    replica-announce-ip $me
+    # No min-replicas-to-write: a new master would refuse writes until a replica has reattached (~10s more
+    # downtime per failover). The price: writes to a master cut off from the rest are lost when it rejoins.
+    EOF
+    [ "$master" = "$me" ] || echo "replicaof $master 6379" >> /data/redis.conf
+
+    # Kept across restarts: holds this Sentinel's identity and the last known topology.
+    if [ ! -f /data/sentinel.conf ]; then
+      cat > /data/sentinel.conf <<EOF
+    port 26379
+    dir /tmp
+    requirepass $REDISCLI_AUTH
+    sentinel sentinel-pass $REDISCLI_AUTH
+    sentinel resolve-hostnames yes
+    sentinel announce-hostnames yes
+    sentinel announce-ip $me
+    sentinel monitor ctfd $master 6379 2
+    sentinel auth-pass ctfd $REDISCLI_AUTH
+    sentinel down-after-milliseconds ctfd 5000
+    sentinel failover-timeout ctfd 30000
+    sentinel parallel-syncs ctfd 1
+    EOF
+    fi
+  # Planned shutdown of the master: hand over first, so drains and updates are nearly seamless.
+  prestop.sh: |
+    role() { redis-cli --raw role | head -n1; }
+    [ "$(role)" = master ] || exit 0
+    for i in 0 1 2; do
+      [ "redis-node-$i" = "$POD_NAME" ] && continue
+      timeout 3 redis-cli -h "redis-node-$i.redis-node.$POD_NAMESPACE.svc.cluster.local" -p 26379 \
+        sentinel failover ctfd 2>/dev/null | grep -q OK && break
+    done
+    for n in $(seq 1 20); do
+      [ "$(role)" = master ] || { sleep 2; exit 0; }
+      sleep 1
+    done
 ---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: redis
+  name: redis-node
   namespace: ctf
-  labels: { app.kubernetes.io/name: redis }
+  labels: { app.kubernetes.io/name: redis-node }
   annotations:
     argocd.argoproj.io/sync-wave: "0"
 spec:
-  serviceName: redis
-  replicas: 1
+  serviceName: redis-node
+  replicas: 3
+  podManagementPolicy: Parallel
+  # Let Sentinel settle (failover-timeout x 2) before the next node is replaced.
+  minReadySeconds: 65
   selector:
-    matchLabels: { app.kubernetes.io/name: redis }
+    matchLabels: { app.kubernetes.io/name: redis-node }
   template:
     metadata:
-      labels: { app.kubernetes.io/name: redis }
+      labels: { app.kubernetes.io/name: redis-node }
     spec:
       automountServiceAccountToken: false
       enableServiceLinks: false
+      terminationGracePeriodSeconds: 45
       securityContext:
         runAsNonRoot: true
         runAsUser: 999
         runAsGroup: 999
         fsGroup: 999
         seccompProfile: { type: RuntimeDefault }
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels: { app.kubernetes.io/name: redis-node }
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: topology.kubernetes.io/zone
+                labelSelector:
+                  matchLabels: { app.kubernetes.io/name: redis-node }
+      initContainers:
+        - name: init
+          image: redis:7.4-alpine
+          command: ["sh", "/scripts/init.sh"]
+          env: &env
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            - name: REDISCLI_AUTH
+              valueFrom: { secretKeyRef: { name: ctfd-redis, key: password } }
+          securityContext: &sc
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          volumeMounts: &mounts
+            - { name: data, mountPath: /data }
+            - { name: scripts, mountPath: /scripts }
       containers:
         - name: redis
           image: redis:7.4-alpine
-          command: ["redis-server"]
-          args:
-            - --requirepass
-            - $(REDIS_PASSWORD)
-            - --appendonly
-            - "yes"
-            - --appendfsync
-            - everysec
-            - --maxmemory
-            - 384mb
-            # Only evict keys with a TTL: the plugin's locks have none and must never be evicted.
-            - --maxmemory-policy
-            - volatile-lru
-          env:
-            - name: REDIS_PASSWORD
-              valueFrom:
-                secretKeyRef: { name: ctfd-redis, key: password }
+          command: ["redis-server", "/data/redis.conf"]
+          env: *env
           ports:
             - { name: redis, containerPort: 6379 }
           readinessProbe:
-            exec: { command: ["sh", "-c", "REDISCLI_AUTH=$REDIS_PASSWORD redis-cli ping | grep -q PONG"] }
+            exec: { command: ["sh", "-c", "timeout 2 redis-cli --raw info replication | grep -qE '^(role:master|master_link_status:up)'"] }
             periodSeconds: 5
             timeoutSeconds: 3
           livenessProbe:
             tcpSocket: { port: redis }
             initialDelaySeconds: 20
+          lifecycle:
+            preStop:
+              exec: { command: ["sh", "/scripts/prestop.sh"] }
           resources:
             requests: { cpu: 100m, memory: 256Mi }
-            limits: { memory: 768Mi }
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities: { drop: ["ALL"] }
-          volumeMounts:
-            - { name: data, mountPath: /data }
+            limits: { memory: 1Gi }
+          securityContext: *sc
+          volumeMounts: *mounts
+        - name: sentinel
+          image: redis:7.4-alpine
+          command: ["redis-sentinel", "/data/sentinel.conf"]
+          env: *env
+          ports:
+            - { name: sentinel, containerPort: 26379 }
+          readinessProbe:
+            exec: { command: ["sh", "-c", "timeout 2 redis-cli -p 26379 ping | grep -q PONG"] }
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            tcpSocket: { port: sentinel }
+            initialDelaySeconds: 20
+          resources:
+            requests: { cpu: 50m, memory: 32Mi }
+            limits: { memory: 128Mi }
+          securityContext: *sc
+          volumeMounts: *mounts
+      volumes:
+        - name: scripts
+          configMap: { name: redis-node }
   volumeClaimTemplates:
     - metadata:
         name: data
       spec:
         accessModes: ["ReadWriteOnce"]
-        storageClassName: longhorn
+        # Redis already keeps a full copy per node.
+        storageClassName: longhorn-single
         resources:
           requests:
             storage: 1Gi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: redis-node
+  namespace: ctf
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: redis-node }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-haproxy
+  namespace: ctf
+data:
+  haproxy.cfg: |
+    global
+      log stdout format raw local0 notice
+      maxconn 4096
+    defaults
+      mode tcp
+      log global
+      timeout connect 3s
+      # redis-py keeps idle connections in a pool.
+      timeout client 1h
+      timeout server 1h
+      timeout check 2s
+      option clitcpka
+      option srvtcpka
+    resolvers k8s
+      parse-resolv-conf
+      hold valid 5s
+      hold nx 5s
+    listen redis
+      bind :6379
+      option tcp-check
+      tcp-check connect
+      tcp-check send "AUTH ${REDIS_PASSWORD}\r\n"
+      tcp-check expect string +OK
+      tcp-check send "INFO replication\r\n"
+      tcp-check expect string role:master
+      # init-state down: a node gets traffic only after it has proven to be master.
+      default-server check init-state down inter 1s fall 2 rise 1 on-marked-down shutdown-sessions resolvers k8s resolve-prefer ipv4 init-addr none
+      server node0 redis-node-0.redis-node.${POD_NAMESPACE}.svc.cluster.local:6379
+      server node1 redis-node-1.redis-node.${POD_NAMESPACE}.svc.cluster.local:6379
+      server node2 redis-node-2.redis-node.${POD_NAMESPACE}.svc.cluster.local:6379
+    frontend health
+      mode http
+      bind :8404
+      # Ready only with a master to forward to.
+      monitor-uri /live
+      http-request return status 200 if { path /ready } { nbsrv(redis) gt 0 }
+      http-request return status 503
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-haproxy
+  namespace: ctf
+  labels: { app.kubernetes.io/name: redis-haproxy }
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app.kubernetes.io/name: redis-haproxy }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: redis-haproxy }
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 99
+        runAsGroup: 99
+        seccompProfile: { type: RuntimeDefault }
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: topology.kubernetes.io/zone
+                labelSelector:
+                  matchLabels: { app.kubernetes.io/name: redis-haproxy }
+            - weight: 50
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels: { app.kubernetes.io/name: redis-haproxy }
+      containers:
+        - name: haproxy
+          image: haproxy:3.2-alpine
+          env:
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            - name: REDIS_PASSWORD
+              valueFrom: { secretKeyRef: { name: ctfd-redis, key: password } }
+          ports:
+            - { name: redis, containerPort: 6379 }
+            - { name: health, containerPort: 8404 }
+          readinessProbe:
+            httpGet: { path: /ready, port: health }
+            periodSeconds: 3
+          livenessProbe:
+            httpGet: { path: /live, port: health }
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: config, mountPath: /usr/local/etc/haproxy }
+      volumes:
+        - name: config
+          configMap: { name: redis-haproxy }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: redis-haproxy
+  namespace: ctf
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: redis-haproxy }
 ---
 # Sessions in Redis are pickled, so write access to Redis means code execution in CTFd.
 apiVersion: networking.k8s.io/v1
@@ -97,11 +363,36 @@ metadata:
   namespace: ctf
 spec:
   podSelector:
-    matchLabels: { app.kubernetes.io/name: redis }
+    matchLabels: { app.kubernetes.io/name: redis-haproxy }
   policyTypes: ["Ingress"]
   ingress:
     - from:
         - podSelector:
             matchLabels: { app.kubernetes.io/name: ctfd }
+        # redis-cli from a node, for maintenance
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: redis-node }
+      ports:
+        - { protocol: TCP, port: 6379 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-node-ingress
+  namespace: ctf
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: redis-node }
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: redis-node }
+      ports:
+        - { protocol: TCP, port: 6379 }
+        - { protocol: TCP, port: 26379 }
+    - from:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: redis-haproxy }
       ports:
         - { protocol: TCP, port: 6379 }
